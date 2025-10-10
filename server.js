@@ -10,6 +10,52 @@ const path = require('path');
 // Cria aplicação Express
 const app = express();
 
+/* ======================  CORS  ====================== */
+// Configuração de CORS:
+// - CORS_ANY=true  -> permite qualquer origem (sem credenciais)
+// - CORS_ORIGINS   -> lista separada por vírgula de origens permitidas
+const CORS_ANY = process.env.CORS_ANY === 'true';
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (CORS_ANY) {
+    // Reflete a origem quando conhecida; fallback para * (sem credenciais)
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  } else if (CORS_ORIGINS.length > 0) {
+    if (origin && CORS_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    // Se quiser forçar bloqueio quando origem não está na lista, remova o else abaixo.
+    else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+  } else {
+    // Padrão: liberar geral (útil quando front e back estão separados e não há cookies)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+
+  res.setHeader('Vary', 'Origin, Access-Control-Request-Headers');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  // Reutiliza o cabeçalho solicitado no preflight para evitar falhas
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
+  );
+  // Se um dia usar cookies/sessão: habilite a linha abaixo e NÃO use '*'
+  // res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+/* =================================================== */
+
 // Configura pool de conexões com PostgreSQL
 // A string de conexão deve ser fornecida via variável de ambiente DATABASE_URL
 // Em plataformas como Railway, a variável PORT também é definida automaticamente.
@@ -43,6 +89,13 @@ function validateSlug(slug) {
 }
 
 /**
+ * Healthcheck simples
+ */
+app.get('/api/healthz', (_req, res) => {
+  res.json({ up: true });
+});
+
+/**
  * Lista os clientes existentes.
  * Percorre as tabelas do schema público que começam com "cliente_" e não terminam em "_totais".
  * Para cada cliente, conta quantos registros há na fila (tabela principal) e devolve `queueCount`.
@@ -54,8 +107,8 @@ app.get('/api/clients', async (req, res) => {
          FROM information_schema.tables
         WHERE table_schema = 'public'
           AND table_type = 'BASE TABLE'
-          AND table_name LIKE 'cliente\_%'
-          AND table_name NOT LIKE '%\_totais';`
+          AND table_name LIKE 'cliente\\_%'
+          AND table_name NOT LIKE '%\\_totais';`
     );
     const tables = result.rows.map((r) => r.table_name);
     const clients = [];
@@ -65,7 +118,6 @@ app.get('/api/clients', async (req, res) => {
         const queueCount = Number(countRes.rows[0].count);
         clients.push({ slug, queueCount });
       } catch (innerErr) {
-        // Se ocorrer erro ao contar (p.ex. tabela inexistente), ignora esse cliente
         console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
       }
@@ -88,7 +140,6 @@ app.post('/api/clients', async (req, res) => {
     return res.status(400).json({ error: 'Slug inválido' });
   }
   try {
-    // Chama a função de criação. Ela deve criar `cliente_slug` e `cliente_slug_totais`.
     await pool.query('SELECT create_full_client_structure($1);', [slug]);
     res.status(201).json({ message: 'Cliente criado com sucesso' });
   } catch (err) {
@@ -112,8 +163,7 @@ app.get('/api/stats', async (req, res) => {
       `SELECT
         (SELECT COUNT(*) FROM "${slug}_totais") AS totais,
         (SELECT COUNT(*) FROM "${slug}_totais" WHERE mensagem_enviada = true) AS enviados,
-        (SELECT COUNT(*) FROM "${slug}") AS fila;
-      `
+        (SELECT COUNT(*) FROM "${slug}") AS fila;`
     );
     const { totais, enviados, fila } = result.rows[0];
     const pendentes = Number(totais) - Number(enviados);
@@ -150,12 +200,9 @@ app.get('/api/queue', async (req, res) => {
   let whereClause = '';
   if (search) {
     values.push(`%${search}%`);
-    // Usa o mesmo placeholder para nome ou telefone; como só há um parâmetro,
-    // passamos a mesma string duas vezes na query.
     whereClause = `WHERE name ILIKE $1 OR phone ILIKE $1`;
   }
   try {
-    // Consulta de itens
     const itemsSql = `
       SELECT name, phone
         FROM "${slug}"
@@ -167,7 +214,6 @@ app.get('/api/queue', async (req, res) => {
     const itemsRes = await pool.query(itemsSql, itemsParams);
     const items = itemsRes.rows;
 
-    // Consulta de contagem total
     const countSql = `SELECT COUNT(*) AS total FROM "${slug}" ${whereClause};`;
     const countRes = await pool.query(countSql, values);
     const total = Number(countRes.rows[0].total);
@@ -213,7 +259,6 @@ app.get('/api/totals', async (req, res) => {
   }
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
   try {
-    // Consulta de itens
     const itemsSql = `
       SELECT name, phone, niche, mensagem_enviada, updated_at
         FROM "${slug}_totais"
@@ -225,7 +270,6 @@ app.get('/api/totals', async (req, res) => {
     const itemsRes = await pool.query(itemsSql, itemsParams);
     const items = itemsRes.rows;
 
-    // Consulta de contagem total
     const countSql = `SELECT COUNT(*) AS total FROM "${slug}_totais" ${whereClause};`;
     const countRes = await pool.query(countSql, params);
     const total = Number(countRes.rows[0].total);
@@ -251,7 +295,6 @@ app.post('/api/contacts', async (req, res) => {
     return res.status(400).json({ error: 'Nome e telefone são obrigatórios' });
   }
   try {
-    // Chama a função de inserção no banco
     const result = await pool.query(
       'SELECT client_add_contact($1, $2, $3, $4) AS status;',
       [client, name, phone, niche || null],
@@ -259,7 +302,6 @@ app.post('/api/contacts', async (req, res) => {
     const status = result.rows[0]?.status || 'inserted';
     res.json({ status });
   } catch (err) {
-    // Violação de chave única (duplicado) retorna código 23505
     if (err.code === '23505') {
       return res.json({ status: 'skipped_conflict' });
     }
@@ -281,11 +323,10 @@ app.delete('/api/queue', async (req, res) => {
     return res.status(400).json({ error: 'Telefone é obrigatório' });
   }
   try {
-    // Remove da fila
     const delRes = await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
     const deletedCount = delRes.rowCount;
-    // Determina se deve marcar como enviado. Se markSent for true, undefined (chamada "Marcar Enviada")
-    // ou se o contato já não existia na fila (deletedCount === 0), então atualiza.
+    // Se markSent = true, ou se veio undefined (botão "Marcar Enviada"),
+    // ou se não havia na fila (deletedCount=0), marca como enviada.
     const shouldMark = markSent === true || typeof markSent === 'undefined' || deletedCount === 0;
     if (shouldMark) {
       await pool.query(
@@ -320,6 +361,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
   let inserted = 0;
   let skipped = 0;
   let errorsCount = 0;
+
   // Se a primeira linha parece ser cabeçalho (contém "name" e "phone"), ignore-a
   let startIndex = 0;
   if (lines.length > 0) {
@@ -353,7 +395,6 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       else skipped++;
     } catch (err) {
       if (err.code === '23505') {
-        // Conflito de chave, considera como skip
         skipped++;
       } else {
         console.error('Erro ao importar linha', i + 1, err);
