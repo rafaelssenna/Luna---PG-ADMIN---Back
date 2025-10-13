@@ -62,47 +62,187 @@ function validateSlug(slug) {
   return /^cliente_[a-z0-9_]+$/.test(slug);
 }
 
+/* ======================  Config por cliente (server-side)  ====================== */
+// Tabela: client_settings (slug PK, auto_run, ia_auto, instance_url, loop_status, last_run_at)
+const runningClients = new Set(); // trava por cliente (evita concorrer)
+
+async function ensureSettingsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS client_settings (
+      slug TEXT PRIMARY KEY,
+      auto_run BOOLEAN DEFAULT false,
+      ia_auto BOOLEAN DEFAULT false,
+      instance_url TEXT,
+      loop_status TEXT DEFAULT 'idle',
+      last_run_at TIMESTAMPTZ
+    );
+  `);
+}
+ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
+
+async function getClientSettings(slug) {
+  const { rows } = await pool.query(
+    'SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at FROM client_settings WHERE slug = $1',
+    [slug]
+  );
+  if (!rows.length) {
+    return { auto_run: false, ia_auto: false, instance_url: null, loop_status: 'idle', last_run_at: null };
+  }
+  return rows[0];
+}
+
+async function saveClientSettings(slug, { autoRun, iaAuto, instanceUrl }) {
+  await pool.query(
+    `INSERT INTO client_settings (slug, auto_run, ia_auto, instance_url)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (slug)
+     DO UPDATE SET auto_run = EXCLUDED.auto_run, ia_auto = EXCLUDED.ia_auto, instance_url = EXCLUDED.instance_url`,
+    [slug, !!autoRun, !!iaAuto, instanceUrl || null]
+  );
+}
+
+// ===== IA (stub) =====
+// Ajuste aqui caso você queira fazer chamada real para sua “instância” de IA.
+// Por padrão, só simula sucesso. Para habilitar envio real, defina IA_CALL=true e
+// coloque uma URL válida em client_settings.instance_url. O payload é { name, phone, client }.
+async function runIAForContact({ client, name, phone, instanceUrl }) {
+  const SHOULD_CALL = process.env.IA_CALL === 'true';
+  if (!SHOULD_CALL || !instanceUrl) {
+    // modo simulado
+    return { ok: true, simulated: true };
+  }
+  try {
+    if (typeof fetch !== 'function') {
+      // Ambiente sem fetch nativo
+      console.warn('IA_CALL habilitado, mas fetch não está disponível. Pulando chamada.');
+      return { ok: true, simulated: true };
+    }
+    const resp = await fetch(instanceUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client, name, phone }),
+    });
+    const ok = resp.ok;
+    return { ok, status: resp.status };
+  } catch (err) {
+    console.error('Falha ao chamar IA', instanceUrl, err);
+    return { ok: false, error: String(err) };
+  }
+}
+
 /**
  * Executa o loop de processamento para um cliente.
- * Percorre a fila do cliente, removendo cada contato e marcando-o como enviado
- * no histórico (tabela _totais). Retorna o número de contatos processados.
+ * Percorre a fila do cliente, (opcional) chama IA automática, remove da fila e
+ * marca como enviada no histórico. Processa em lotes para evitar loops longos.
  *
  * @param {string} clientSlug Slug do cliente (p.ex. "cliente_x")
- * @returns {Promise<{processed: number}>}
+ * @param {object} [opts]
+ * @param {number} [opts.batchSize] tamanho do lote (padrão: env LOOP_BATCH_SIZE ou 50)
+ * @returns {Promise<{processed: number, status: 'ok'|'already_running'}>}
  */
-async function runLoopForClient(clientSlug) {
+async function runLoopForClient(clientSlug, opts = {}) {
   if (!validateSlug(clientSlug)) {
     throw new Error('Slug inválido');
   }
-  // Verifica se a tabela da fila existe
-  const exists = await tableExists(clientSlug);
-  if (!exists) {
-    return { processed: 0 };
+
+  // trava concorrência por cliente
+  if (runningClients.has(clientSlug)) {
+    return { processed: 0, status: 'already_running' };
   }
-  // Recupera todos os telefones na fila
-  const { rows } = await pool.query(`SELECT phone FROM "${clientSlug}";`);
-  let processed = 0;
-  for (const { phone } of rows) {
-    try {
-      // Remove da fila
-      await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
-    } catch (err) {
-      console.error('Erro ao deletar da fila', err);
-    }
-    try {
-      // Marca como enviada no histórico, se existir
+  runningClients.add(clientSlug);
+
+  const batchSize = parseInt(process.env.LOOP_BATCH_SIZE, 10) || opts.batchSize || 50;
+
+  try {
+    // Atualiza status -> running
+    await pool.query(
+      `INSERT INTO client_settings (slug, loop_status, last_run_at)
+       VALUES ($1, 'running', NOW())
+       ON CONFLICT (slug) DO UPDATE SET loop_status = 'running', last_run_at = NOW()`,
+      [clientSlug]
+    );
+
+    // Verifica se a tabela de fila existe
+    const exists = await tableExists(clientSlug);
+    if (!exists) {
+      // Volta status -> idle
       await pool.query(
-        `UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
-        [phone],
+        `INSERT INTO client_settings (slug, loop_status, last_run_at)
+         VALUES ($1, 'idle', NOW())
+         ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
+        [clientSlug]
       );
-    } catch (err) {
-      // Pode falhar caso a tabela _totais não exista; registra erro mas continua
-      console.error('Erro ao atualizar histórico', err);
+      return { processed: 0, status: 'ok' };
     }
-    processed++;
+
+    const settings = await getClientSettings(clientSlug);
+    let processed = 0;
+
+    // Processa em lotes para evitar pegar a tabela inteira
+    while (processed < batchSize) {
+      const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`);
+      if (next.rows.length === 0) break; // fila vazia
+
+      const { name, phone } = next.rows[0];
+
+      // Chama IA (se habilitado)
+      if (settings.ia_auto) {
+        const r = await runIAForContact({
+          client: clientSlug,
+          name,
+          phone,
+          instanceUrl: settings.instance_url,
+        });
+        // Se falhar, ainda assim seguimos removendo da fila (ajuste aqui se quiser exigir sucesso antes de marcar)
+        if (!r.ok) {
+          console.warn(`[${clientSlug}] IA retornou erro para ${phone}. Prosseguindo com marcação mesmo assim.`);
+        }
+      }
+
+      // Remove da fila
+      try {
+        await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
+      } catch (err) {
+        console.error('Erro ao deletar da fila', clientSlug, phone, err);
+      }
+
+      // Marca como enviada no histórico (se existir)
+      try {
+        await pool.query(
+          `UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
+          [phone],
+        );
+      } catch (err) {
+        // Pode falhar caso a tabela _totais não exista; registra erro mas continua
+        console.error('Erro ao atualizar histórico', clientSlug, phone, err);
+      }
+
+      processed++;
+    }
+
+    // Volta status -> idle
+    await pool.query(
+      `INSERT INTO client_settings (slug, loop_status, last_run_at)
+       VALUES ($1, 'idle', NOW())
+       ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
+      [clientSlug]
+    );
+
+    return { processed, status: 'ok' };
+  } catch (err) {
+    // Marca erro
+    await pool.query(
+      `INSERT INTO client_settings (slug, loop_status, last_run_at)
+       VALUES ($1, 'error', NOW())
+       ON CONFLICT (slug) DO UPDATE SET loop_status = 'error', last_run_at = NOW()`,
+      [clientSlug]
+    );
+    throw err;
+  } finally {
+    runningClients.delete(clientSlug);
   }
-  return { processed };
 }
+/* ============================================================================ */
 
 /* ======== Helpers ======== */
 async function tableExists(tableName) {
@@ -182,7 +322,7 @@ app.get('/api/healthz', (_req, res) => {
   res.json({ up: true });
 });
 
-/** Lista clientes (slug e fila) */
+/** Lista clientes (slug e fila) + flags salvas */
 app.get('/api/clients', async (_req, res) => {
   try {
     const result = await pool.query(
@@ -197,9 +337,15 @@ app.get('/api/clients', async (_req, res) => {
     const clients = [];
     for (const slug of tables) {
       try {
-        const countRes = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
+        const [countRes, cfgRes] = await Promise.all([
+          pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`),
+          pool.query(`SELECT auto_run, ia_auto, instance_url FROM client_settings WHERE slug = $1;`, [slug]),
+        ]);
         const queueCount = Number(countRes.rows[0].count);
-        clients.push({ slug, queueCount });
+        const autoRun = !!(cfgRes.rows[0]?.auto_run);
+        const iaAuto = !!(cfgRes.rows[0]?.ia_auto);
+        const instanceUrl = cfgRes.rows[0]?.instance_url || null;
+        clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl });
       } catch (innerErr) {
         console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
@@ -510,6 +656,54 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
   res.json({ inserted, skipped, errors: errorsCount });
 });
 
+/** Lê configurações do cliente (auto_run, ia_auto, instance_url, status) */
+app.get('/api/client-settings', async (req, res) => {
+  const slug = req.query.client;
+  if (!slug || !validateSlug(slug)) {
+    return res.status(400).json({ error: 'Cliente inválido' });
+  }
+  try {
+    const cfg = await getClientSettings(slug);
+    res.json({
+      autoRun: !!cfg.auto_run,
+      iaAuto: !!cfg.ia_auto,
+      instanceUrl: cfg.instance_url || null,
+      loopStatus: cfg.loop_status || 'idle',
+      lastRunAt: cfg.last_run_at || null,
+    });
+  } catch (err) {
+    console.error('Erro ao obter configurações', err);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+/** Salva configurações do cliente (auto_run, ia_auto, instance_url) */
+app.post('/api/client-settings', async (req, res) => {
+  const { client, autoRun, iaAuto, instanceUrl } = req.body || {};
+  if (!client || !validateSlug(client)) {
+    return res.status(400).json({ error: 'Cliente inválido' });
+  }
+  try {
+    // Validação simples da URL (opcional)
+    if (instanceUrl) {
+      try { new URL(instanceUrl); } catch { return res.status(400).json({ error: 'instanceUrl inválida' }); }
+    }
+    await saveClientSettings(client, { autoRun, iaAuto, instanceUrl });
+    const cfg = await getClientSettings(client);
+    res.json({
+      ok: true,
+      settings: {
+        autoRun: !!cfg.auto_run,
+        iaAuto: !!cfg.ia_auto,
+        instanceUrl: cfg.instance_url || null,
+      }
+    });
+  } catch (err) {
+    console.error('Erro ao salvar configurações', err);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
 /**
  * Endpoint para iniciar manualmente o loop de processamento de um cliente.
  * Espera um body JSON com { client: 'cliente_x' }. Retorna a quantidade de contatos processados.
@@ -521,7 +715,7 @@ app.post('/api/loop', async (req, res) => {
   }
   try {
     const result = await runLoopForClient(clientSlug);
-    return res.json({ message: 'Loop executado', processed: result.processed });
+    return res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
   } catch (err) {
     console.error('Erro ao executar loop manual', err);
     return res.status(500).json({ error: 'Erro interno ao executar loop' });
@@ -532,30 +726,24 @@ app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-/* =====================  Loop Automático  ===================== */
+/* =====================  Loop Automático (scheduler)  ===================== */
 // Intervalo em milissegundos para executar o loop automaticamente.
 // Pode ser configurado via variável de ambiente LOOP_INTERVAL_MS (padrão: 60000ms = 1 minuto).
 const LOOP_INTERVAL_MS = parseInt(process.env.LOOP_INTERVAL_MS, 10) || 60000;
 
-// Agenda execução periódica de loops para todos os clientes.
 setInterval(async () => {
   try {
-    // Lista todas as tabelas de clientes (sem sufixo _totais)
-    const result = await pool.query(
-      `SELECT table_name FROM information_schema.tables
-       WHERE table_schema = 'public'
-         AND table_type = 'BASE TABLE'
-         AND table_name LIKE 'cliente\\_%'
-         AND table_name NOT LIKE '%\\_totais';`,
-    );
-    for (const row of result.rows) {
-      const slug = row.table_name;
+    // Apenas clientes com auto_run = true
+    const { rows } = await pool.query(`SELECT slug FROM client_settings WHERE auto_run = true;`);
+    for (const { slug } of rows) {
       try {
-        // Verifica se há itens na fila para o cliente
-        const countRes = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
-        const queueCount = Number(countRes.rows[0].count);
+        if (runningClients.has(slug)) continue; // já em execução
+        const exists = await tableExists(slug);
+        if (!exists) continue;
+        const cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
+        const queueCount = Number(cnt.rows[0].count);
         if (queueCount > 0) {
-          await runLoopForClient(slug);
+          runLoopForClient(slug).catch((e) => console.error('Auto-run erro', slug, e));
         }
       } catch (err) {
         console.error('Erro ao executar loop automático para', slug, err);
@@ -565,7 +753,7 @@ setInterval(async () => {
     console.error('Erro no scheduler de loop automático', err);
   }
 }, LOOP_INTERVAL_MS);
-/* ============================================================= */
+/* ======================================================================== */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
