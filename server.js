@@ -38,8 +38,9 @@ app.use((req, res, next) => {
     'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
   );
-  // Habilitar esta linha caso utilize sessões/cookies:
+  // Se um dia usar cookies/sessão, habilite:
   // res.setHeader('Access-Control-Allow-Credentials', 'true');
+
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
@@ -59,6 +60,12 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 function validateSlug(slug) {
   return /^cliente_[a-z0-9_]+$/.test(slug);
+}
+
+/* ======== Helpers ======== */
+async function tableExists(tableName) {
+  const { rows } = await pool.query(`SELECT to_regclass($1) AS reg;`, [`public.${tableName}`]);
+  return !!rows[0].reg;
 }
 
 /* ======== CSV Utilitários ======== */
@@ -178,25 +185,43 @@ app.post('/api/clients', async (req, res) => {
   }
 });
 
-/** KPIs */
+/** KPIs (blindado) */
 app.get('/api/stats', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
+
+  const filaTable = `${slug}`;
+  const totaisTable = `${slug}_totais`;
+
   try {
-    const result = await pool.query(
-      `SELECT
-        (SELECT COUNT(*) FROM "${slug}_totais") AS totais,
-        (SELECT COUNT(*) FROM "${slug}_totais" WHERE mensagem_enviada = true) AS enviados,
-        (SELECT COUNT(*) FROM "${slug}") AS fila;`
-    );
-    const { totais, enviados, fila } = result.rows[0];
-    res.json({
-      totais: Number(totais),
-      enviados: Number(enviados),
-      pendentes: Number(totais) - Number(enviados),
-      fila: Number(fila),
+    const [hasFila, hasTotais] = await Promise.all([
+      tableExists(filaTable),
+      tableExists(totaisTable),
+    ]);
+
+    let totais = 0, enviados = 0, fila = 0;
+
+    if (hasTotais) {
+      const r = await pool.query(
+        `SELECT
+           (SELECT COUNT(*) FROM "${totaisTable}") AS totais,
+           (SELECT COUNT(*) FROM "${totaisTable}" WHERE mensagem_enviada = true) AS enviados;`
+      );
+      totais   = Number(r.rows[0].totais);
+      enviados = Number(r.rows[0].enviados);
+    }
+    if (hasFila) {
+      const r2 = await pool.query(`SELECT COUNT(*) AS fila FROM "${filaTable}";`);
+      fila = Number(r2.rows[0].fila);
+    }
+
+    return res.json({
+      totais,
+      enviados,
+      pendentes: totais - enviados,
+      fila,
     });
   } catch (err) {
     console.error('Erro ao obter estatísticas', err);
@@ -204,12 +229,17 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-/** Fila (pagina/filtra) */
+/** Fila (pagina/filtra) — blindado para tabela ausente */
 app.get('/api/queue', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
+  const exists = await tableExists(slug);
+  if (!exists) {
+    return res.json({ items: [], total: 0 });
+  }
+
   const page = parseInt(req.query.page) || 1;
   const pageSize = parseInt(req.query.pageSize) || 25;
   const search = req.query.search || '';
@@ -240,12 +270,19 @@ app.get('/api/queue', async (req, res) => {
   }
 });
 
-/** Históricos (pagina/filtra) */
+/** Históricos (pagina/filtra) — blindado para tabela ausente */
 app.get('/api/totals', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
+
+  const totaisTable = `${slug}_totais`;
+  const exists = await tableExists(totaisTable);
+  if (!exists) {
+    return res.json({ items: [], total: 0 });
+  }
+
   const page = parseInt(req.query.page) || 1;
   const pageSize = parseInt(req.query.pageSize) || 25;
   const search = req.query.search || '';
@@ -267,14 +304,14 @@ app.get('/api/totals', async (req, res) => {
   try {
     const itemsSql = `
       SELECT name, phone, niche, mensagem_enviada, updated_at
-        FROM "${slug}_totais"
+        FROM "${totaisTable}"
       ${whereClause}
       ORDER BY updated_at DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2};
     `;
     const itemsRes = await pool.query(itemsSql, [...params, pageSize, offset]);
     const items = itemsRes.rows;
-    const countSql = `SELECT COUNT(*) AS total FROM "${slug}_totais" ${whereClause};`;
+    const countSql = `SELECT COUNT(*) AS total FROM "${totaisTable}" ${whereClause};`;
     const countRes = await pool.query(countSql, params);
     const total = Number(countRes.rows[0].total);
     res.json({ items, total });
