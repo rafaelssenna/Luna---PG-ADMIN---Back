@@ -100,10 +100,49 @@ async function saveClientSettings(slug, { autoRun, iaAuto, instanceUrl }) {
   );
 }
 
-// ===== IA (stub) =====
-// Ajuste aqui caso você queira fazer chamada real para sua “instância” de IA.
-// Por padrão, só simula sucesso. Para habilitar envio real, defina IA_CALL=true e
-// coloque uma URL válida em client_settings.instance_url. O payload é { name, phone, client }.
+/* ======================  IA (UAZAPI) ====================== */
+/**
+ * Integração com UAZAPI para envio de texto (POST /send/text ou equivalente).
+ * Tudo é configurável por .env para não precisar mudar código quando o endpoint
+ * pedir nomes de campos/headers diferentes.
+ *
+ * Variáveis úteis:
+ *   IA_CALL=true                       -> liga o envio real
+ *   MESSAGE_TEMPLATE="Olá {NAME}..."   -> template da mensagem
+ *   UAZAPI_TOKEN=xxxx                  -> token da UAZAPI
+ *   UAZAPI_AUTH_HEADER=Authorization   -> nome do header de auth (ex.: Authorization, X-API-KEY)
+ *   UAZAPI_AUTH_SCHEME="Bearer "       -> esquema (ex.: "Bearer ", "" se não usar)
+ *   UAZAPI_PHONE_FIELD=to              -> nome do campo do telefone (ex.: to, phone)
+ *   UAZAPI_TEXT_FIELD=text             -> nome do campo da mensagem (ex.: text, message)
+ *   UAZAPI_PHONE_DIGITS_ONLY=false     -> se true, envia só dígitos (sem +/55)
+ *   UAZAPI_EXTRA='{"instance":"x"}'    -> JSON com campos extras exigidos
+ */
+
+function normalizePhoneE164BR(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('55')) return `+${digits}`;
+  if (digits.length === 11) return `+55${digits}`;
+  return `+${digits}`;
+}
+function fillTemplate(tpl, vars) {
+  return String(tpl || '').replace(/\{(NAME|CLIENT|PHONE)\}/gi, (_, k) => {
+    const key = k.toUpperCase();
+    return vars[key] ?? '';
+  });
+}
+const UAZ = {
+  token: process.env.UAZAPI_TOKEN || '',
+  authHeader: process.env.UAZAPI_AUTH_HEADER || 'Authorization',
+  authScheme: (process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer '),
+  phoneField: process.env.UAZAPI_PHONE_FIELD || 'to',
+  textField: process.env.UAZAPI_TEXT_FIELD || 'text',
+  digitsOnly: process.env.UAZAPI_PHONE_DIGITS_ONLY === 'true',
+  extra: (() => { try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); } catch { return {}; } })(),
+  template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
+};
+
+// Envia um texto simples na UAZAPI (POST /send/text por padrão)
 async function runIAForContact({ client, name, phone, instanceUrl }) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) {
@@ -116,18 +155,34 @@ async function runIAForContact({ client, name, phone, instanceUrl }) {
       console.warn('IA_CALL habilitado, mas fetch não está disponível. Pulando chamada.');
       return { ok: true, simulated: true };
     }
+
+    const e164 = normalizePhoneE164BR(phone);
+    const toFieldValue = UAZ.digitsOnly ? e164.replace(/\D/g, '') : e164;
+    const text = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
+
+    const payload = { ...UAZ.extra };
+    payload[UAZ.phoneField] = toFieldValue;
+    payload[UAZ.textField]  = text;
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (UAZ.token) headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+
     const resp = await fetch(instanceUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client, name, phone }),
+      headers,
+      body: JSON.stringify(payload),
     });
-    const ok = resp.ok;
-    return { ok, status: resp.status };
+
+    let body;
+    try { body = await resp.json(); } catch { body = await resp.text(); }
+
+    return { ok: resp.ok, status: resp.status, body };
   } catch (err) {
-    console.error('Falha ao chamar IA', instanceUrl, err);
+    console.error('Falha ao chamar UAZAPI', instanceUrl, err);
     return { ok: false, error: String(err) };
   }
 }
+/* ======================================================== */
 
 /**
  * Executa o loop de processamento para um cliente.
