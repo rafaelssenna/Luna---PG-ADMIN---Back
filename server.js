@@ -7,48 +7,39 @@ const { Pool } = require('pg');
 const multer = require('multer');
 const path = require('path');
 
-// Cria aplicação Express
 const app = express();
 
 /* ======================  CORS  ====================== */
 // Configuração de CORS:
-// - CORS_ANY=true  -> permite qualquer origem (sem credenciais)
-// - CORS_ORIGINS   -> lista separada por vírgula de origens permitidas
+// - Defina CORS_ANY=true para permitir qualquer origem (sem credenciais).
+// - Ou defina CORS_ORIGINS (lista separada por vírgula) para liberar origens específicas.
 const CORS_ANY = process.env.CORS_ANY === 'true';
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
   if (CORS_ANY) {
-    // Reflete a origem quando conhecida; fallback para * (sem credenciais)
     res.setHeader('Access-Control-Allow-Origin', origin || '*');
   } else if (CORS_ORIGINS.length > 0) {
     if (origin && CORS_ORIGINS.includes(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
-    }
-    // Se quiser forçar bloqueio quando origem não está na lista, remova o else abaixo.
-    else {
+    } else {
       res.setHeader('Access-Control-Allow-Origin', '*');
     }
   } else {
-    // Padrão: liberar geral (útil quando front e back estão separados e não há cookies)
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
-
   res.setHeader('Vary', 'Origin, Access-Control-Request-Headers');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  // Reutiliza o cabeçalho solicitado no preflight para evitar falhas
   res.setHeader(
     'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
   );
-  // Se um dia usar cookies/sessão: habilite a linha abaixo e NÃO use '*'
+  // Habilitar esta linha caso utilize sessões/cookies:
   // res.setHeader('Access-Control-Allow-Credentials', 'true');
-
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
@@ -56,51 +47,94 @@ app.use((req, res, next) => {
 });
 /* =================================================== */
 
-// Configura pool de conexões com PostgreSQL
-// A string de conexão deve ser fornecida via variável de ambiente DATABASE_URL
-// Em plataformas como Railway, a variável PORT também é definida automaticamente.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Muitos serviços em nuvem exigem SSL; se a variável DATABASE_SSL for 'true'
-  // ativamos SSL com verificação de certificado desativada.
   ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
 });
 
-// Middleware para interpretar JSON de requisições
 app.use(express.json());
-
-// Servir arquivos estáticos (HTML, CSS e JS da interface)
-// Os arquivos index.html, styles.css e app.js estão na raiz do projeto.
 app.use(express.static(path.join(__dirname)));
 
-// Configura o upload de arquivos em memória (para importação CSV)
 const upload = multer({ storage: multer.memoryStorage() });
 
-/**
- * Valida o slug (identificador) de um cliente.
- * Apenas valores no formato 'cliente_<alphanum_underscore>' são aceitos.
- * Isso previne SQL injection quando o slug é interpolado como nome de tabela.
- *
- * @param {string} slug
- * @returns {boolean}
- */
 function validateSlug(slug) {
   return /^cliente_[a-z0-9_]+$/.test(slug);
 }
 
-/**
- * Healthcheck simples
- */
+/* ======== CSV Utilitários ======== */
+function norm(s) {
+  return (s ?? '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+function detectDelimiter(firstLine) {
+  const commas = (firstLine.match(/,/g) || []).length;
+  const semis  = (firstLine.match(/;/g) || []).length;
+  return semis > commas ? ';' : ',';
+}
+function parseCSV(text, delim) {
+  const rows = [];
+  let row = [], val = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (inQuotes && text[i + 1] === '"') {
+        val += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (ch === '\r') continue;
+    if (ch === '\n' && !inQuotes) {
+      row.push(val);
+      rows.push(row);
+      row = [];
+      val = '';
+      continue;
+    }
+    if (ch === delim && !inQuotes) {
+      row.push(val);
+      val = '';
+      continue;
+    }
+    val += ch;
+  }
+  if (val.length > 0 || row.length > 0) {
+    row.push(val);
+    rows.push(row);
+  }
+  return rows;
+}
+function mapHeader(headerCells) {
+  const idx = { name: -1, phone: -1, niche: -1 };
+  const names = headerCells.map((h) => norm(h));
+  const isId = (h) => ['id', 'identificador', 'codigo', 'código'].includes(h);
+  const nameKeys  = new Set(['nome','name','full_name','fullname','contato','empresa','nomefantasia','razaosocial']);
+  const phoneKeys = new Set(['telefone','numero','número','phone','whatsapp','celular','mobile','telemovel']);
+  const nicheKeys = new Set(['nicho','niche','segmento','categoria','industry']);
+
+  names.forEach((h, i) => {
+    if (isId(h)) return;
+    if (idx.name === -1  && nameKeys.has(h))  idx.name  = i;
+    if (idx.phone === -1 && phoneKeys.has(h)) idx.phone = i;
+    if (idx.niche === -1 && nicheKeys.has(h)) idx.niche = i;
+  });
+  return idx;
+}
+/* ================================= */
+
+/** Healthcheck */
 app.get('/api/healthz', (_req, res) => {
   res.json({ up: true });
 });
 
-/**
- * Lista os clientes existentes.
- * Percorre as tabelas do schema público que começam com "cliente_" e não terminam em "_totais".
- * Para cada cliente, conta quantos registros há na fila (tabela principal) e devolve `queueCount`.
- */
-app.get('/api/clients', async (req, res) => {
+/** Lista clientes (slug e fila) */
+app.get('/api/clients', async (_req, res) => {
   try {
     const result = await pool.query(
       `SELECT table_name
@@ -129,11 +163,7 @@ app.get('/api/clients', async (req, res) => {
   }
 });
 
-/**
- * Cria um novo cliente.
- * Espera body JSON { slug: 'cliente_nome' }.
- * Invoca a função stored procedure create_full_client_structure para criar as tabelas e triggers.
- */
+/** Cria novo cliente */
 app.post('/api/clients', async (req, res) => {
   const { slug } = req.body;
   if (!slug || !validateSlug(slug)) {
@@ -148,11 +178,7 @@ app.post('/api/clients', async (req, res) => {
   }
 });
 
-/**
- * Retorna estatísticas resumidas para um cliente.
- * Query params: client=<slug>
- * Responde com { totais, enviados, pendentes, fila }
- */
+/** KPIs */
 app.get('/api/stats', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
@@ -166,11 +192,10 @@ app.get('/api/stats', async (req, res) => {
         (SELECT COUNT(*) FROM "${slug}") AS fila;`
     );
     const { totais, enviados, fila } = result.rows[0];
-    const pendentes = Number(totais) - Number(enviados);
     res.json({
       totais: Number(totais),
       enviados: Number(enviados),
-      pendentes,
+      pendentes: Number(totais) - Number(enviados),
       fila: Number(fila),
     });
   } catch (err) {
@@ -179,14 +204,7 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-/**
- * Lista itens da fila de um cliente, com paginação e busca.
- * Query params:
- *  - client=<slug>
- *  - page=<número>
- *  - pageSize=<tamanho>
- *  - search=<termo de busca>
- */
+/** Fila (pagina/filtra) */
 app.get('/api/queue', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
@@ -210,14 +228,11 @@ app.get('/api/queue', async (req, res) => {
       ORDER BY name
       LIMIT $${values.length + 1} OFFSET $${values.length + 2};
     `;
-    const itemsParams = [...values, pageSize, offset];
-    const itemsRes = await pool.query(itemsSql, itemsParams);
+    const itemsRes = await pool.query(itemsSql, [...values, pageSize, offset]);
     const items = itemsRes.rows;
-
     const countSql = `SELECT COUNT(*) AS total FROM "${slug}" ${whereClause};`;
     const countRes = await pool.query(countSql, values);
     const total = Number(countRes.rows[0].total);
-
     res.json({ items, total });
   } catch (err) {
     console.error('Erro ao consultar fila', err);
@@ -225,15 +240,7 @@ app.get('/api/queue', async (req, res) => {
   }
 });
 
-/**
- * Lista itens do histórico total de um cliente, com paginação, busca e filtro de status.
- * Query params:
- *  - client=<slug>
- *  - page=<número>
- *  - pageSize=<tamanho>
- *  - search=<termo de busca>
- *  - sent=all|sim|nao (enviados ou não)
- */
+/** Históricos (pagina/filtra) */
 app.get('/api/totals', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
@@ -248,14 +255,13 @@ app.get('/api/totals', async (req, res) => {
   const params = [];
   if (search) {
     params.push(`%${search}%`);
-    conditions.push(`(name ILIKE $${params.length} OR phone ILIKE $${params.length} OR niche ILIKE $${params.length})`);
+    conditions.push(
+      `(name ILIKE $${params.length} OR phone ILIKE $${params.length} OR niche ILIKE $${params.length})`
+    );
   }
   if (sent !== 'all') {
-    if (sent === 'sim') {
-      conditions.push('mensagem_enviada = true');
-    } else if (sent === 'nao') {
-      conditions.push('mensagem_enviada = false');
-    }
+    if (sent === 'sim') conditions.push('mensagem_enviada = true');
+    else if (sent === 'nao') conditions.push('mensagem_enviada = false');
   }
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
   try {
@@ -266,14 +272,11 @@ app.get('/api/totals', async (req, res) => {
       ORDER BY updated_at DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2};
     `;
-    const itemsParams = [...params, pageSize, offset];
-    const itemsRes = await pool.query(itemsSql, itemsParams);
+    const itemsRes = await pool.query(itemsSql, [...params, pageSize, offset]);
     const items = itemsRes.rows;
-
     const countSql = `SELECT COUNT(*) AS total FROM "${slug}_totais" ${whereClause};`;
     const countRes = await pool.query(countSql, params);
     const total = Number(countRes.rows[0].total);
-
     res.json({ items, total });
   } catch (err) {
     console.error('Erro ao consultar totais', err);
@@ -281,11 +284,7 @@ app.get('/api/totals', async (req, res) => {
   }
 });
 
-/**
- * Adiciona um contato individual ao cliente.
- * Body JSON: { client: <slug>, name: <string>, phone: <string>, niche?: <string|null> }
- * Retorna { status: 'inserted'|'skipped_conflict'|'skipped_already_known' }
- */
+/** Adiciona um contato individual */
 app.post('/api/contacts', async (req, res) => {
   const { client, name, phone, niche } = req.body;
   if (!client || !validateSlug(client)) {
@@ -297,23 +296,18 @@ app.post('/api/contacts', async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT client_add_contact($1, $2, $3, $4) AS status;',
-      [client, name, phone, niche || null],
+      [client, name, phone, niche || null]
     );
     const status = result.rows[0]?.status || 'inserted';
     res.json({ status });
   } catch (err) {
-    if (err.code === '23505') {
-      return res.json({ status: 'skipped_conflict' });
-    }
+    if (err.code === '23505') return res.json({ status: 'skipped_conflict' });
     console.error('Erro ao adicionar contato', err);
     res.status(500).json({ error: 'Erro interno ao adicionar contato' });
   }
 });
 
-/**
- * Remove um contato da fila e opcionalmente marca como enviado no histórico.
- * Body JSON: { client: <slug>, phone: <string>, markSent?: boolean }
- */
+/** Remove da fila e, opcionalmente, marca como enviada nos totais */
 app.delete('/api/queue', async (req, res) => {
   const { client, phone, markSent } = req.body;
   if (!client || !validateSlug(client)) {
@@ -325,13 +319,15 @@ app.delete('/api/queue', async (req, res) => {
   try {
     const delRes = await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
     const deletedCount = delRes.rowCount;
-    // Se markSent = true, ou se veio undefined (botão "Marcar Enviada"),
-    // ou se não havia na fila (deletedCount=0), marca como enviada.
-    const shouldMark = markSent === true || typeof markSent === 'undefined' || deletedCount === 0;
+    // Marca como enviada se markSent = true, ou undefined (botão "Marcar Enviada"), ou se nem estava na fila.
+    const shouldMark =
+      markSent === true ||
+      typeof markSent === 'undefined' ||
+      deletedCount === 0;
     if (shouldMark) {
       await pool.query(
         `UPDATE "${client}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
-        [phone],
+        [phone]
       );
     }
     res.json({ status: 'ok' });
@@ -341,13 +337,7 @@ app.delete('/api/queue', async (req, res) => {
   }
 });
 
-/**
- * Importa contatos em lote a partir de arquivo CSV.
- * FormData com campos:
- *  - file: arquivo CSV (campo "file")
- *  - client: slug do cliente
- * Responde com { inserted: n, skipped: m, errors: k }
- */
+/** Importa contatos via CSV (mapeando cabeçalhos, ignorando ID, com heurísticas) */
 app.post('/api/import', upload.single('file'), async (req, res) => {
   const slug = req.body.client;
   if (!slug || !validateSlug(slug)) {
@@ -357,30 +347,67 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     return res.status(400).json({ error: 'Arquivo CSV não enviado' });
   }
   const text = req.file.buffer.toString('utf-8');
-  const lines = text.split(/\r?\n/);
+  if (!text.trim()) {
+    return res.status(400).json({ error: 'CSV vazio' });
+  }
+  const firstLine = text.split(/\r?\n/)[0];
+  const delim = detectDelimiter(firstLine);
+  const rows = parseCSV(text, delim).filter((r) =>
+    r.some((c) => (c || '').trim() !== '')
+  );
+  if (rows.length === 0) {
+    return res.json({ inserted: 0, skipped: 0, errors: 0 });
+  }
+  const header = rows[0].map((c) => (c ?? '').toString().trim());
+  const hasHeaderHints = header.some((h) =>
+    /nome|name|telefone|n[uú]mero|phone|whats|celular|nicho|niche/i.test(h)
+  );
+  let startIndex = 0;
+  let map = { name: -1, phone: -1, niche: -1 };
+  if (hasHeaderHints) {
+    map = mapHeader(header);
+    startIndex = 1;
+  }
+  // Fallback heurístico se não detectou cabeçalhos
+  if (map.phone === -1 || map.name === -1) {
+    const sample = rows[Math.min(startIndex, rows.length - 1)];
+    let phoneIdx = -1;
+    let nameIdx = -1;
+    sample.forEach((v, i) => {
+      const digits = (v || '').replace(/\D/g, '');
+      if (phoneIdx === -1 && digits.length >= 10) phoneIdx = i;
+    });
+    if (phoneIdx !== -1) {
+      for (let i = 0; i < sample.length; i++) {
+        if (i === phoneIdx) continue;
+        const s = (sample[i] || '').trim();
+        const isMostlyDigits = /^\d{1,}$/.test(s);
+        if (!isMostlyDigits && !/^id$/i.test(norm(header[i] || ''))) {
+          nameIdx = i;
+          break;
+        }
+      }
+    }
+    if (phoneIdx !== -1 && nameIdx !== -1) {
+      map.phone = phoneIdx;
+      map.name = nameIdx;
+    }
+  }
+  if (map.phone === -1 || map.name === -1) {
+    return res.status(400).json({
+      error:
+        'Não foi possível identificar colunas de nome e telefone no CSV.',
+    });
+  }
   let inserted = 0;
   let skipped = 0;
   let errorsCount = 0;
-
-  // Se a primeira linha parece ser cabeçalho (contém "name" e "phone"), ignore-a
-  let startIndex = 0;
-  if (lines.length > 0) {
-    const h = lines[0].toLowerCase();
-    if (h.includes('name') && h.includes('phone')) {
-      startIndex = 1;
-    }
-  }
-  for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const parts = line.split(',');
-    if (parts.length < 2) {
-      errorsCount++;
-      continue;
-    }
-    const name = parts[0]?.trim();
-    const phone = parts[1]?.trim();
-    const niche = parts[2] ? parts[2].trim() : null;
+  for (let r = startIndex; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row) continue;
+    const name  = (row[map.name]  ?? '').toString().trim();
+    const phone = (row[map.phone] ?? '').toString().trim();
+    const niche = map.niche !== -1 ? (row[map.niche] ?? '').toString().trim() : null;
     if (!name || !phone) {
       errorsCount++;
       continue;
@@ -388,16 +415,15 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     try {
       const result = await pool.query(
         'SELECT client_add_contact($1, $2, $3, $4) AS status;',
-        [slug, name, phone, niche || null],
+        [slug, name, phone, niche || null]
       );
       const status = result.rows[0]?.status || 'inserted';
       if (status === 'inserted') inserted++;
       else skipped++;
     } catch (err) {
-      if (err.code === '23505') {
-        skipped++;
-      } else {
-        console.error('Erro ao importar linha', i + 1, err);
+      if (err.code === '23505') skipped++;
+      else {
+        console.error('Erro ao importar linha', r + 1, err);
         errorsCount++;
       }
     }
@@ -405,12 +431,10 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
   res.json({ inserted, skipped, errors: errorsCount });
 });
 
-// Rota final: envia index.html para qualquer rota não reconhecida (SPA fallback)
-app.get('*', (req, res) => {
+app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Inicia o servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
