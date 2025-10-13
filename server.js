@@ -10,9 +10,8 @@ const path = require('path');
 const app = express();
 
 /* ======================  CORS  ====================== */
-// Configuração de CORS:
-// - Defina CORS_ANY=true para permitir qualquer origem (sem credenciais).
-// - Ou defina CORS_ORIGINS (lista separada por vírgula) para liberar origens específicas.
+// - CORS_ANY=true  => libera qualquer origem (sem credenciais)
+// - CORS_ORIGINS   => lista separada por vírgulas com origens específicas
 const CORS_ANY = process.env.CORS_ANY === 'true';
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -113,7 +112,7 @@ async function runIAForContact({ client, name, phone, instanceUrl }) {
   }
   try {
     if (typeof fetch !== 'function') {
-      // Ambiente sem fetch nativo
+      // Ambiente sem fetch nativo (Node < 18)
       console.warn('IA_CALL habilitado, mas fetch não está disponível. Pulando chamada.');
       return { ok: true, simulated: true };
     }
@@ -178,7 +177,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
     const settings = await getClientSettings(clientSlug);
     let processed = 0;
 
-    // Processa em lotes para evitar pegar a tabela inteira
+    // Processa em lotes
     while (processed < batchSize) {
       const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`);
       if (next.rows.length === 0) break; // fila vazia
@@ -193,7 +192,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
           phone,
           instanceUrl: settings.instance_url,
         });
-        // Se falhar, ainda assim seguimos removendo da fila (ajuste aqui se quiser exigir sucesso antes de marcar)
         if (!r.ok) {
           console.warn(`[${clientSlug}] IA retornou erro para ${phone}. Prosseguindo com marcação mesmo assim.`);
         }
@@ -213,7 +211,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
           [phone],
         );
       } catch (err) {
-        // Pode falhar caso a tabela _totais não exista; registra erro mas continua
         console.error('Erro ao atualizar histórico', clientSlug, phone, err);
       }
 
