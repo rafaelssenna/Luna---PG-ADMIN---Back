@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "https://luna-pg-admin-back-production.up.railway.app/api/$1"
+    }
+  ]
+}
