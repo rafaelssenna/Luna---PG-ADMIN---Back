@@ -35,7 +35,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
+    req.headers['access-control-request-headers'] || 'Content-Type, Authorization, token'
   );
   // Se um dia usar cookies/sessão, habilite:
   // res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -62,7 +62,7 @@ function validateSlug(slug) {
 }
 
 /* ======================  Config por cliente (server-side)  ====================== */
-// Tabela: client_settings (slug PK, auto_run, ia_auto, instance_url, loop_status, last_run_at)
+// Tabela: client_settings (slug PK, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, loop_status, last_run_at)
 const runningClients = new Set(); // trava por cliente (evita concorrer)
 
 async function ensureSettingsTable() {
@@ -72,31 +72,70 @@ async function ensureSettingsTable() {
       auto_run BOOLEAN DEFAULT false,
       ia_auto BOOLEAN DEFAULT false,
       instance_url TEXT,
+      -- novos campos (podem não existir em instalações antigas)
+      instance_token TEXT,
+      instance_auth_header TEXT,
+      instance_auth_scheme TEXT,
       loop_status TEXT DEFAULT 'idle',
       last_run_at TIMESTAMPTZ
     );
+    ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_token TEXT;
+    ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_header TEXT;
+    ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_scheme TEXT;
+    ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS loop_status TEXT DEFAULT 'idle';
+    ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ;
   `);
 }
 ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
 
 async function getClientSettings(slug) {
   const { rows } = await pool.query(
-    'SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at FROM client_settings WHERE slug = $1',
+    `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at,
+            instance_token, instance_auth_header, instance_auth_scheme
+       FROM client_settings
+      WHERE slug = $1`,
     [slug]
   );
   if (!rows.length) {
-    return { auto_run: false, ia_auto: false, instance_url: null, loop_status: 'idle', last_run_at: null };
+    return {
+      auto_run: false,
+      ia_auto: false,
+      instance_url: null,
+      instance_token: null,
+      instance_auth_header: null,
+      instance_auth_scheme: null,
+      loop_status: 'idle',
+      last_run_at: null
+    };
   }
   return rows[0];
 }
 
-async function saveClientSettings(slug, { autoRun, iaAuto, instanceUrl }) {
+async function saveClientSettings(
+  slug,
+  { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme }
+) {
   await pool.query(
-    `INSERT INTO client_settings (slug, auto_run, ia_auto, instance_url)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO client_settings
+       (slug, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme)
+     VALUES ($1,   $2,       $3,     $4,           $5,             $6,                   $7)
      ON CONFLICT (slug)
-     DO UPDATE SET auto_run = EXCLUDED.auto_run, ia_auto = EXCLUDED.ia_auto, instance_url = EXCLUDED.instance_url`,
-    [slug, !!autoRun, !!iaAuto, instanceUrl || null]
+     DO UPDATE SET
+       auto_run = EXCLUDED.auto_run,
+       ia_auto = EXCLUDED.ia_auto,
+       instance_url = EXCLUDED.instance_url,
+       instance_token = EXCLUDED.instance_token,
+       instance_auth_header = EXCLUDED.instance_auth_header,
+       instance_auth_scheme = EXCLUDED.instance_auth_scheme`,
+    [
+      slug,
+      !!autoRun,
+      !!iaAuto,
+      instanceUrl || null,
+      instanceToken || null,
+      (instanceAuthHeader || 'token'),
+      (instanceAuthScheme ?? '')
+    ]
   );
 }
 
@@ -214,7 +253,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
       .replace(/\{TEXT\}/g, encodeURIComponent(text));
     const method = methodEnv === 'post' ? 'POST' : 'GET';
     const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
-    if (UAZ.token && method === 'POST') headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
     return { url, method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
@@ -223,13 +261,12 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     const u = new URL(instanceUrl);
     u.searchParams.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
     u.searchParams.set(UAZ.textField, text);
-    // adiciona extras simples na query (strings/números/bool)
+    // extras simples
     Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
       if (['string','number','boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
     });
     const method = methodEnv === 'post' ? 'POST' : 'GET';
     const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
-    if (UAZ.token && method === 'POST') headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
     return { url: u.toString(), method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
@@ -240,21 +277,19 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     form.set(UAZ.textField, text);
     Object.entries(UAZ.extra || {}).forEach(([k, v]) => form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v)));
     const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-    if (UAZ.token) headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
     return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
   }
 
-  // JSON (padrão) → POST application/json
+  // JSON (padrão)
   const payload = { ...UAZ.extra };
   payload[UAZ.phoneField] = UAZ.digitsOnly ? digits : e164;
   payload[UAZ.textField]  = text;
   const headers = { 'Content-Type': 'application/json' };
-  if (UAZ.token) headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
   return { url: instanceUrl, method: 'POST', headers, body: JSON.stringify(payload) };
 }
 
-// Envio "URL-only": só precisa da instanceUrl correta
-async function runIAForContact({ client, name, phone, instanceUrl }) {
+// Envio "URL-only": usa token/cabeçalho do CLIENTE (override do .env)
+async function runIAForContact({ client, name, phone, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme }) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
 
@@ -264,6 +299,27 @@ async function runIAForContact({ client, name, phone, instanceUrl }) {
     const text  = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
+
+    // Header/token por cliente (override do .env)
+    const hdrName   = (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
+    const hdrScheme = (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
+    const tokenVal  = (instanceToken && String(instanceToken)) || UAZ.token || '';
+
+    if (tokenVal) {
+      req.headers = req.headers || {};
+      req.headers[hdrName] = `${hdrScheme}${tokenVal}`;
+    }
+
+    // DEBUG enxuto (sem vazar o token)
+    if (process.env.DEBUG === 'true') {
+      console.log('[UAZAPI] request', {
+        url: req.url,
+        method: req.method,
+        headers: Object.fromEntries(Object.entries(req.headers || {}).map(([k,v]) => [k, k.toLowerCase().includes('token') || k.toLowerCase().includes('authorization') ? '***' : v])),
+        hasBody: !!req.body
+      });
+    }
+
     const resp = await httpSend(req);
     let body; try { body = await resp.json(); } catch { body = await resp.text(); }
 
@@ -278,13 +334,6 @@ async function runIAForContact({ client, name, phone, instanceUrl }) {
 
 /**
  * Executa o loop de processamento para um cliente.
- * Percorre a fila do cliente, (opcional) chama IA automática, remove da fila e
- * marca como enviada no histórico. Processa em lotes para evitar loops longos.
- *
- * @param {string} clientSlug Slug do cliente (p.ex. "cliente_x")
- * @param {object} [opts]
- * @param {number} [opts.batchSize] tamanho do lote (padrão: env LOOP_BATCH_SIZE ou 50)
- * @returns {Promise<{processed: number, status: 'ok'|'already_running'}>}
  */
 async function runLoopForClient(clientSlug, opts = {}) {
   if (!validateSlug(clientSlug)) {
@@ -336,7 +385,15 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
       // Chama IA (se habilitado)
       if (useIA) {
-        const r = await runIAForContact({ client: clientSlug, name, phone, instanceUrl: settings.instance_url });
+        const r = await runIAForContact({
+          client: clientSlug,
+          name,
+          phone,
+          instanceUrl: settings.instance_url,
+          instanceToken: settings.instance_token,
+          instanceAuthHeader: settings.instance_auth_header,
+          instanceAuthScheme: settings.instance_auth_scheme
+        });
         if (!r.ok) {
           console.warn(`[${clientSlug}] IA retornou erro para ${phone}. Prosseguindo com marcação mesmo assim.`);
         }
@@ -493,13 +550,11 @@ app.get('/api/clients', async (_req, res) => {
         const autoRun = !!(cfgRes.rows[0]?.auto_run);
         const iaAuto = !!(cfgRes.rows[0]?.ia_auto);
         const instanceUrl = cfgRes.rows[0]?.instance_url || null;
-        // Novo: inclui o status do loop e a data da última execução
         const loopStatus = cfgRes.rows[0]?.loop_status || 'idle';
         const lastRunAt = cfgRes.rows[0]?.last_run_at || null;
         clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt });
       } catch (innerErr) {
         console.error('Erro ao contar fila para', slug, innerErr);
-        // Ainda retornamos o slug para não omitir este cliente da lista
         clients.push({ slug });
       }
     }
@@ -696,7 +751,6 @@ app.delete('/api/queue', async (req, res) => {
   try {
     const delRes = await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
     const deletedCount = delRes.rowCount;
-    // Marca como enviada se markSent = true, ou undefined (botão "Marcar Enviada"), ou se nem estava na fila.
     const shouldMark =
       markSent === true ||
       typeof markSent === 'undefined' ||
@@ -714,101 +768,7 @@ app.delete('/api/queue', async (req, res) => {
   }
 });
 
-/** Importa contatos via CSV (mapeando cabeçalhos, ignorando ID, com heurísticas) */
-app.post('/api/import', upload.single('file'), async (req, res) => {
-  const slug = req.body.client;
-  if (!slug || !validateSlug(slug)) {
-    return res.status(400).json({ error: 'Cliente inválido' });
-  }
-  if (!req.file) {
-    return res.status(400).json({ error: 'Arquivo CSV não enviado' });
-  }
-  const text = req.file.buffer.toString('utf-8');
-  if (!text.trim()) {
-    return res.status(400).json({ error: 'CSV vazio' });
-  }
-  const firstLine = text.split(/\r?\n/)[0];
-  const delim = detectDelimiter(firstLine);
-  const rows = parseCSV(text, delim).filter((r) =>
-    r.some((c) => (c || '').trim() !== '')
-  );
-  if (rows.length === 0) {
-    return res.json({ inserted: 0, skipped: 0, errors: 0 });
-  }
-  const header = rows[0].map((c) => (c ?? '').toString().trim());
-  const hasHeaderHints = header.some((h) =>
-    /nome|name|telefone|n[uú]mero|phone|whats|celular|nicho|niche/i.test(h)
-  );
-  let startIndex = 0;
-  let map = { name: -1, phone: -1, niche: -1 };
-  if (hasHeaderHints) {
-    map = mapHeader(header);
-    startIndex = 1;
-  }
-  // Fallback heurístico se não detectou cabeçalhos
-  if (map.phone === -1 || map.name === -1) {
-    const sample = rows[Math.min(startIndex, rows.length - 1)];
-    let phoneIdx = -1;
-    let nameIdx = -1;
-    sample.forEach((v, i) => {
-      const digits = (v || '').replace(/\D/g, '');
-      if (phoneIdx === -1 && digits.length >= 10) phoneIdx = i;
-    });
-    if (phoneIdx !== -1) {
-      for (let i = 0; i < sample.length; i++) {
-        if (i === phoneIdx) continue;
-        const s = (sample[i] || '').trim();
-        const isMostlyDigits = /^\d{1,}$/.test(s);
-        if (!isMostlyDigits && !/^id$/i.test(norm(header[i] || ''))) {
-          nameIdx = i;
-          break;
-        }
-      }
-    }
-    if (phoneIdx !== -1 && nameIdx !== -1) {
-      map.phone = phoneIdx;
-      map.name = nameIdx;
-    }
-  }
-  if (map.phone === -1 || map.name === -1) {
-    return res.status(400).json({
-      error:
-        'Não foi possível identificar colunas de nome e telefone no CSV.',
-    });
-  }
-  let inserted = 0;
-  let skipped = 0;
-  let errorsCount = 0;
-  for (let r = startIndex; r < rows.length; r++) {
-    const row = rows[r];
-    if (!row) continue;
-    const name  = (row[map.name]  ?? '').toString().trim();
-    const phone = (row[map.phone] ?? '').toString().trim();
-    const niche = map.niche !== -1 ? (row[map.niche] ?? '').toString().trim() : null;
-    if (!name || !phone) {
-      errorsCount++;
-      continue;
-    }
-    try {
-      const result = await pool.query(
-        'SELECT client_add_contact($1, $2, $3, $4) AS status;',
-        [slug, name, phone, niche || null]
-      );
-      const status = result.rows[0]?.status || 'inserted';
-      if (status === 'inserted') inserted++;
-      else skipped++;
-    } catch (err) {
-      if (err.code === '23505') skipped++;
-      else {
-        console.error('Erro ao importar linha', r + 1, err);
-        errorsCount++;
-      }
-    }
-  }
-  res.json({ inserted, skipped, errors: errorsCount });
-});
-
-/** Lê configurações do cliente (auto_run, ia_auto, instance_url, status) */
+/** Lê configurações do cliente (inclui token/header/scheme) */
 app.get('/api/client-settings', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
@@ -820,6 +780,9 @@ app.get('/api/client-settings', async (req, res) => {
       autoRun: !!cfg.auto_run,
       iaAuto: !!cfg.ia_auto,
       instanceUrl: cfg.instance_url || null,
+      instanceToken: cfg.instance_token || '',
+      instanceAuthHeader: cfg.instance_auth_header || 'token',
+      instanceAuthScheme: cfg.instance_auth_scheme || '',
       loopStatus: cfg.loop_status || 'idle',
       lastRunAt: cfg.last_run_at || null,
     });
@@ -829,27 +792,19 @@ app.get('/api/client-settings', async (req, res) => {
   }
 });
 
-/** Salva configurações do cliente (auto_run, ia_auto, instance_url) */
+/** Salva configurações do cliente (inclui token/header/scheme) */
 app.post('/api/client-settings', async (req, res) => {
-  const { client, autoRun, iaAuto, instanceUrl } = req.body || {};
+  const { client, autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme } = req.body || {};
   if (!client || !validateSlug(client)) {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
   try {
-    // Validação simples da URL (opcional)
     if (instanceUrl) {
       try { new URL(instanceUrl); } catch { return res.status(400).json({ error: 'instanceUrl inválida' }); }
     }
-    await saveClientSettings(client, { autoRun, iaAuto, instanceUrl });
+    await saveClientSettings(client, { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme });
     const cfg = await getClientSettings(client);
-    res.json({
-      ok: true,
-      settings: {
-        autoRun: !!cfg.auto_run,
-        iaAuto: !!cfg.ia_auto,
-        instanceUrl: cfg.instance_url || null,
-      }
-    });
+    res.json({ ok: true, settings: cfg });
   } catch (err) {
     console.error('Erro ao salvar configurações', err);
     res.status(500).json({ error: 'Erro interno' });
