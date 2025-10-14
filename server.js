@@ -100,22 +100,27 @@ async function saveClientSettings(slug, { autoRun, iaAuto, instanceUrl }) {
   );
 }
 
-/* ======================  IA (UAZAPI) ====================== */
+/* ======================  IA (UAZAPI URL-ONLY FLEX) ====================== */
 /**
- * Integração com UAZAPI para envio de texto (POST /send/text ou equivalente).
- * Tudo é configurável por .env para não precisar mudar código quando o endpoint
- * pedir nomes de campos/headers diferentes.
+ * Integração flexível com UAZAPI baseada APENAS na URL da instância.
+ * Suporta automaticamente:
+ *  - TEMPLATE: placeholders {NUMBER}/{PHONE_E164}/{TEXT} → GET (ou POST se forçado)
+ *  - QUERY: URL já contém ?number=...&text=... → GET (ou POST se forçado)
+ *  - JSON: POST application/json (padrão)
+ *  - FORM: POST application/x-www-form-urlencoded (se UAZAPI_PAYLOAD_STYLE=form)
  *
- * Variáveis úteis:
- *   IA_CALL=true                       -> liga o envio real
- *   MESSAGE_TEMPLATE="Olá {NAME}..."   -> template da mensagem
- *   UAZAPI_TOKEN=xxxx                  -> token da UAZAPI
- *   UAZAPI_AUTH_HEADER=Authorization   -> nome do header de auth (ex.: Authorization, X-API-KEY)
- *   UAZAPI_AUTH_SCHEME="Bearer "       -> esquema (ex.: "Bearer ", "" se não usar)
- *   UAZAPI_PHONE_FIELD=to              -> nome do campo do telefone (ex.: to, phone)
- *   UAZAPI_TEXT_FIELD=text             -> nome do campo da mensagem (ex.: text, message)
- *   UAZAPI_PHONE_DIGITS_ONLY=false     -> se true, envia só dígitos (sem +/55)
- *   UAZAPI_EXTRA='{"instance":"x"}'    -> JSON com campos extras exigidos
+ * Variáveis úteis (.env):
+ *   IA_CALL=true
+ *   MESSAGE_TEMPLATE="Olá {NAME}..."
+ *   UAZAPI_TOKEN=
+ *   UAZAPI_AUTH_HEADER=Authorization
+ *   UAZAPI_AUTH_SCHEME="Bearer "
+ *   UAZAPI_PHONE_FIELD=number
+ *   UAZAPI_TEXT_FIELD=text
+ *   UAZAPI_PHONE_DIGITS_ONLY=true
+ *   UAZAPI_PAYLOAD_STYLE=auto   # auto|json|form|query|template
+ *   UAZAPI_METHOD=auto          # auto|get|post
+ *   UAZAPI_EXTRA='{"instance":"x"}'
  */
 
 function normalizePhoneE164BR(phone) {
@@ -131,130 +136,145 @@ function fillTemplate(tpl, vars) {
     return vars[key] ?? '';
   });
 }
+
 const UAZ = {
-  // Token de acesso fornecido pela UAZAPI. Pode ser enviado em um cabeçalho customizado ou
-  // como parte do corpo, dependendo da configuração da instância. Consulte UAZAPI_AUTH_HEADER
-  // e UAZAPI_AUTH_SCHEME para ajustar o cabeçalho de autenticação.
   token: process.env.UAZAPI_TOKEN || '',
-  // Nome do cabeçalho que receberá o token (por exemplo: Authorization, X-API-KEY ou token).
   authHeader: process.env.UAZAPI_AUTH_HEADER || 'Authorization',
-  // Prefixo do esquema de autenticação. Muitos serviços usam "Bearer ", outros usam vazio.
   authScheme: (process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer '),
-  // Nome do campo onde será enviado o número de destino. A documentação da UAZAPI recomenda
-  // utilizar o campo "number" para mensagens de texto. Por compatibilidade, o valor padrão
-  // foi alterado de "to" para "number". Defina UAZAPI_PHONE_FIELD no .env para sobrescrever.
   phoneField: process.env.UAZAPI_PHONE_FIELD || 'number',
-  // Nome do campo onde será enviada a mensagem de texto. A documentação utiliza "text".
-  textField: process.env.UAZAPI_TEXT_FIELD || 'text',
-  // Se true, envia apenas dígitos (remove + e 55). Caso contrário, envia no formato E.164.
-  digitsOnly: process.env.UAZAPI_PHONE_DIGITS_ONLY === 'true',
-  // Objeto JSON com campos extras exigidos pela instância. Ex.: {"instance":"minha_instancia"}
-  extra: (() => {
-    try {
-      return JSON.parse(process.env.UAZAPI_EXTRA || '{}');
-    } catch {
-      return {};
-    }
-  })(),
-  // Template padrão da mensagem. Os placeholders {NAME}, {CLIENT} e {PHONE} serão
-  // substituídos pelos valores reais na hora do envio.
+  textField:  process.env.UAZAPI_TEXT_FIELD  || 'text',
+  digitsOnly: (process.env.UAZAPI_PHONE_DIGITS_ONLY || 'true') === 'true',
+  payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'auto').toLowerCase(), // auto|json|form|query|template
+  methodPref:   (process.env.UAZAPI_METHOD || 'auto').toLowerCase(),        // auto|get|post
+  extra: (() => { try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); } catch { return {}; } })(),
   template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
 };
 
-// Envia um texto simples na UAZAPI (POST /send/text por padrão)
-async function runIAForContact({ client, name, phone, instanceUrl }) {
-  const SHOULD_CALL = process.env.IA_CALL === 'true';
-  // Se o envio real estiver desabilitado ou não houver URL, apenas simula sucesso.
-  if (!SHOULD_CALL || !instanceUrl) {
-    return { ok: true, simulated: true };
+// HTTP genérico: usa fetch se existir; senão tenta node-fetch; senão https nativo
+async function httpSend({ url, method, headers, body }) {
+  if (typeof fetch === 'function') {
+    return fetch(url, { method, headers, body });
   }
   try {
-    // Helper para obter uma função de fetch. Se o ambiente suportar fetch nativo (Node >=18), usa-se direto.
-    // Caso contrário, utiliza o módulo https nativo para realizar a requisição.
-    const doFetch = async (url, options) => {
-      if (typeof fetch === 'function') {
-        return fetch(url, options);
-      }
-      // fallback com https
-      return new Promise((resolve, reject) => {
-        try {
-          const urlObj = new URL(url);
-          const httpMod = urlObj.protocol === 'https:' ? require('https') : require('http');
-          const req = httpMod.request(
-            {
-              hostname: urlObj.hostname,
-              port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-              path: urlObj.pathname + urlObj.search,
-              method: options.method || 'GET',
-              headers: options.headers || {},
-            },
-            (res) => {
-              let data = '';
-              res.on('data', (chunk) => {
-                data += chunk;
-              });
-              res.on('end', () => {
-                const response = {
-                  ok: res.statusCode >= 200 && res.statusCode < 300,
-                  status: res.statusCode,
-                  json: async () => {
-                    try {
-                      return JSON.parse(data);
-                    } catch {
-                      return data;
-                    }
-                  },
-                  text: async () => data,
-                };
-                resolve(response);
-              });
-            }
-          );
-          req.on('error', (err) => reject(err));
-          if (options.body) req.write(options.body);
-          req.end();
-        } catch (err) {
-          reject(err);
-        }
-      });
-    };
-
-    const e164 = normalizePhoneE164BR(phone);
-    const toFieldValue = UAZ.digitsOnly ? e164.replace(/\D/g, '') : e164;
-    const text = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
-
-    // Monta o payload com campos extras, número e texto.
-    const payload = { ...UAZ.extra };
-    payload[UAZ.phoneField] = toFieldValue;
-    payload[UAZ.textField] = text;
-
-    // Cabeçalhos. Sempre envia JSON. Se houver token, adiciona cabeçalho de autenticação.
-    const headers = { 'Content-Type': 'application/json' };
-    if (UAZ.token) {
-      headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+    // tente node-fetch se estiver disponível na imagem
+    const nf = require('node-fetch'); // se não existir, cai no catch
+    if (nf) {
+      return nf(url, { method, headers, body });
     }
-
-    const resp = await doFetch(instanceUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-    });
-
-    // Tenta obter JSON, senão retorna texto.
-    let body;
+  } catch {}
+  // https nativo
+  return new Promise((resolve, reject) => {
     try {
-      body = await resp.json();
-    } catch {
-      body = await resp.text();
+      const urlObj = new URL(url);
+      const httpMod = urlObj.protocol === 'https:' ? require('https') : require('http');
+      const req = httpMod.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+          path: urlObj.pathname + urlObj.search,
+          method: method || 'GET',
+          headers: headers || {},
+        },
+        (res) => {
+          let data = '';
+          res.on('data', (chunk) => (data += chunk));
+          res.on('end', () => {
+            resolve({
+              ok: res.statusCode >= 200 && res.statusCode < 300,
+              status: res.statusCode,
+              json: async () => { try { return JSON.parse(data); } catch { return { raw: data }; } },
+              text: async () => data,
+            });
+          });
+        }
+      );
+      req.on('error', reject);
+      if (body) req.write(body);
+      req.end();
+    } catch (err) {
+      reject(err);
     }
+  });
+}
 
+function buildUazRequest(instanceUrl, { e164, digits, text }) {
+  const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
+  const hasQueryNumber = /[?&](number|phone|to)=/i.test(instanceUrl);
+  const style = UAZ.payloadStyle;
+  const methodEnv = UAZ.methodPref;
+
+  // decide método automaticamente
+  const methodAuto = (methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber))) ? 'GET' : 'POST';
+
+  // TEMPLATE → substitui placeholders e usa GET (ou POST se forçado)
+  if (style === 'template' || hasTpl) {
+    let url = instanceUrl
+      .replace(/\{NUMBER\}/g, digits)
+      .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
+      .replace(/\{TEXT\}/g, encodeURIComponent(text));
+    const method = methodEnv === 'post' ? 'POST' : 'GET';
+    const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
+    if (UAZ.token && method === 'POST') headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+    return { url, method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
+  }
+
+  // QUERY → preenche querystring e usa GET (ou POST se forçado)
+  if (style === 'query' || hasQueryNumber) {
+    const u = new URL(instanceUrl);
+    u.searchParams.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
+    u.searchParams.set(UAZ.textField, text);
+    // adiciona extras simples na query (strings/números/bool)
+    Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
+      if (['string','number','boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
+    });
+    const method = methodEnv === 'post' ? 'POST' : 'GET';
+    const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
+    if (UAZ.token && method === 'POST') headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+    return { url: u.toString(), method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
+  }
+
+  // FORM → POST x-www-form-urlencoded
+  if (style === 'form') {
+    const form = new URLSearchParams();
+    form.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
+    form.set(UAZ.textField, text);
+    Object.entries(UAZ.extra || {}).forEach(([k, v]) => form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v)));
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    if (UAZ.token) headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+    return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
+  }
+
+  // JSON (padrão) → POST application/json
+  const payload = { ...UAZ.extra };
+  payload[UAZ.phoneField] = UAZ.digitsOnly ? digits : e164;
+  payload[UAZ.textField]  = text;
+  const headers = { 'Content-Type': 'application/json' };
+  if (UAZ.token) headers[UAZ.authHeader] = `${UAZ.authScheme || ''}${UAZ.token}`;
+  return { url: instanceUrl, method: 'POST', headers, body: JSON.stringify(payload) };
+}
+
+// Envio "URL-only": só precisa da instanceUrl correta
+async function runIAForContact({ client, name, phone, instanceUrl }) {
+  const SHOULD_CALL = process.env.IA_CALL === 'true';
+  if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
+
+  try {
+    const e164  = normalizePhoneE164BR(phone);
+    const digits = e164.replace(/\D/g, '');
+    const text  = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
+
+    const req = buildUazRequest(instanceUrl, { e164, digits, text });
+    const resp = await httpSend(req);
+    let body; try { body = await resp.json(); } catch { body = await resp.text(); }
+
+    if (!resp.ok) console.error('UAZAPI FAIL', { status: resp.status, body });
     return { ok: resp.ok, status: resp.status, body };
   } catch (err) {
-    console.error('Falha ao chamar UAZAPI', instanceUrl, err);
+    console.error('UAZAPI ERROR', instanceUrl, err);
     return { ok: false, error: String(err) };
   }
 }
-/* ======================================================== */
+/* ======================================================================= */
 
 /**
  * Executa o loop de processamento para um cliente.
@@ -304,9 +324,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
     const settings = await getClientSettings(clientSlug);
     let processed = 0;
 
-    // Determina se a IA deve ser chamada em cada iteração.
-    // Se o cliente enviou um override (via req.body.iaAuto), usamos esse valor.
-    // Caso contrário, usamos o valor persistido em client_settings.ia_auto.
+    // Determina se a IA deve ser chamada
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
 
     // Processa em lotes
@@ -840,7 +858,7 @@ app.post('/api/client-settings', async (req, res) => {
 
 /**
  * Endpoint para iniciar manualmente o loop de processamento de um cliente.
- * Espera um body JSON com { client: 'cliente_x' }. Retorna a quantidade de contatos processados.
+ * Espera um body JSON com { client: 'cliente_x', iaAuto?: boolean }.
  */
 app.post('/api/loop', async (req, res) => {
   const clientSlug = req.body?.client;
@@ -849,8 +867,6 @@ app.post('/api/loop', async (req, res) => {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
   try {
-    // O parâmetro iaAuto (boolean) permite que o front force o envio da IA mesmo se
-    // a opção não estiver ativada no banco. Se undefined, mantém o comportamento padrão.
     const result = await runLoopForClient(clientSlug, { iaAutoOverride });
     return res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
   } catch (err) {
