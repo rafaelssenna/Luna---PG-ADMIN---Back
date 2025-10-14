@@ -739,32 +739,56 @@ app.post('/api/contacts', async (req, res) => {
   }
 });
 
-/** Remove da fila e, opcionalmente, marca como enviada nos totais */
-app.delete('/api/queue', async (req, res) => {
-  const { client, phone, markSent } = req.body;
-  if (!client || !validateSlug(client)) {
-    return res.status(400).json({ error: 'Cliente inválido' });
-  }
-  if (!phone) {
-    return res.status(400).json({ error: 'Telefone é obrigatório' });
-  }
+/** Importa CSV (arquivo + slug) */
+app.post('/api/import', upload.single('file'), async (req, res) => {
   try {
-    const delRes = await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
-    const deletedCount = delRes.rowCount;
-    const shouldMark =
-      markSent === true ||
-      typeof markSent === 'undefined' ||
-      deletedCount === 0;
-    if (shouldMark) {
-      await pool.query(
-        `UPDATE "${client}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
-        [phone]
-      );
+    const slug = req.body?.client;
+    if (!slug || !validateSlug(slug)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
     }
-    res.json({ status: 'ok' });
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: 'Arquivo não enviado' });
+    }
+
+    const text = req.file.buffer.toString('utf8');
+    const firstLine = (text.split(/\r?\n/)[0] || '');
+    const delim = detectDelimiter(firstLine);
+    const rows = parseCSV(text, delim);
+
+    if (!rows.length) return res.json({ inserted: 0, skipped: 0, errors: 0 });
+
+    const header = rows[0] || [];
+    const idx = mapHeader(header);
+    if (idx.name === -1 || idx.phone === -1) {
+      return res.status(400).json({ error: 'Cabeçalho inválido. Precisa conter colunas de nome e telefone.' });
+    }
+
+    let inserted = 0, skipped = 0, errors = 0;
+
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r.length) continue;
+      const name = (r[idx.name] || '').toString().trim();
+      const phone = (r[idx.phone] || '').toString().trim();
+      const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
+
+      if (!name || !phone) { skipped++; continue; }
+
+      try {
+        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, name, phone, niche]);
+        const status = q.rows[0]?.status || 'inserted';
+        if (status === 'inserted') inserted++;
+        else skipped++;
+      } catch (e) {
+        console.error('Erro linha CSV', i, e);
+        errors++;
+      }
+    }
+
+    res.json({ inserted, skipped, errors });
   } catch (err) {
-    console.error('Erro ao remover/atualizar contato da fila', err);
-    res.status(500).json({ error: 'Erro interno ao remover contato' });
+    console.error('Erro no import CSV', err);
+    res.status(500).json({ error: 'Erro interno ao importar CSV' });
   }
 });
 
@@ -808,6 +832,36 @@ app.post('/api/client-settings', async (req, res) => {
   } catch (err) {
     console.error('Erro ao salvar configurações', err);
     res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+/** Apaga completamente as tabelas e as configurações de um cliente */
+app.delete('/api/delete-client', async (req, res) => {
+  try {
+    const client = req.body?.client || req.query?.client;
+    if (!client || !validateSlug(client)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
+    }
+
+    // Bloqueia se o loop deste cliente estiver rodando
+    if (runningClients.has(client)) {
+      return res.status(409).json({ error: 'Loop em execução para este cliente. Tente novamente em instantes.' });
+    }
+
+    await pool.query('BEGIN');
+    await pool.query(`DROP TABLE IF EXISTS "${client}" CASCADE;`);
+    await pool.query(`DROP TABLE IF EXISTS "${client}_totais" CASCADE;`);
+    await pool.query(`DELETE FROM client_settings WHERE slug = $1;`, [client]);
+    await pool.query('COMMIT');
+
+    // Garantia: remover eventual trava residual
+    runningClients.delete(client);
+
+    return res.json({ status: 'ok', deleted: client });
+  } catch (err) {
+    console.error('Erro ao apagar cliente', err);
+    try { await pool.query('ROLLBACK'); } catch {}
+    return res.status(500).json({ error: 'Erro interno ao apagar cliente' });
   }
 });
 
