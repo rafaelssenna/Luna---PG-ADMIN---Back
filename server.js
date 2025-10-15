@@ -265,11 +265,9 @@ async function httpSend({ url, method, headers, body }) {
 
 function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
-  const hasQueryNumber = /[?&](number|phone|to)=/i.test(instanceUrl);
+  const hasQueryNumber = /[?&](number|phone|to)/i.test(instanceUrl);
   const style = UAZ.payloadStyle;
   const methodEnv = UAZ.methodPref;
-
-  // decide método automaticamente
   const methodAuto = (methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber))) ? 'GET' : 'POST';
 
   // TEMPLATE → substitui placeholders e usa GET (ou POST se forçado)
@@ -455,14 +453,12 @@ async function runLoopForClient(clientSlug, opts = {}) {
           at: new Date().toISOString(),
         });
       } catch (err) {
-        console.error('Erro ao emitir progresso', clientSlug, phone, err);
       }
 
       // Remove da fila
       try {
         await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
       } catch (err) {
-        console.error('Erro ao deletar da fila', clientSlug, phone, err);
       }
 
       // Marca como enviada no histórico (se existir)
@@ -472,7 +468,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
           [phone],
         );
       } catch (err) {
-        console.error('Erro ao atualizar histórico', clientSlug, phone, err);
       }
 
       processed++;
@@ -619,13 +614,11 @@ app.get('/api/clients', async (_req, res) => {
         const lastRunAt = cfgRes.rows[0]?.last_run_at || null;
         clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt });
       } catch (innerErr) {
-        console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
       }
     }
     res.json(clients);
   } catch (err) {
-    console.error('Erro ao listar clientes', err);
     res.status(500).json({ error: 'Erro interno ao listar clientes' });
   }
 });
@@ -640,7 +633,6 @@ app.post('/api/clients', async (req, res) => {
     await pool.query('SELECT create_full_client_structure($1);', [slug]);
     res.status(201).json({ message: 'Cliente criado com sucesso' });
   } catch (err) {
-    console.error('Erro ao criar cliente', err);
     res.status(500).json({ error: 'Erro interno ao criar cliente' });
   }
 });
@@ -684,7 +676,6 @@ app.get('/api/stats', async (req, res) => {
       fila,
     });
   } catch (err) {
-    console.error('Erro ao obter estatísticas', err);
     res.status(500).json({ error: 'Erro interno ao obter estatísticas' });
   }
 });
@@ -725,7 +716,6 @@ app.get('/api/queue', async (req, res) => {
     const total = Number(countRes.rows[0].total);
     res.json({ items, total });
   } catch (err) {
-    console.error('Erro ao consultar fila', err);
     res.status(500).json({ error: 'Erro interno ao consultar fila' });
   }
 });
@@ -776,7 +766,6 @@ app.get('/api/totals', async (req, res) => {
     const total = Number(countRes.rows[0].total);
     res.json({ items, total });
   } catch (err) {
-    console.error('Erro ao consultar totais', err);
     res.status(500).json({ error: 'Erro interno ao consultar totais' });
   }
 });
@@ -799,7 +788,6 @@ app.post('/api/contacts', async (req, res) => {
     res.json({ status });
   } catch (err) {
     if (err.code === '23505') return res.json({ status: 'skipped_conflict' });
-    console.error('Erro ao adicionar contato', err);
     res.status(500).json({ error: 'Erro interno ao adicionar contato' });
   }
 });
@@ -845,14 +833,12 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
         if (status === 'inserted') inserted++;
         else skipped++;
       } catch (e) {
-        console.error('Erro linha CSV', i, e);
         errors++;
       }
     }
 
     res.json({ inserted, skipped, errors });
   } catch (err) {
-    console.error('Erro no import CSV', err);
     res.status(500).json({ error: 'Erro interno ao importar CSV' });
   }
 });
@@ -876,7 +862,6 @@ app.get('/api/client-settings', async (req, res) => {
       lastRunAt: cfg.last_run_at || null,
     });
   } catch (err) {
-    console.error('Erro ao obter configurações', err);
     res.status(500).json({ error: 'Erro interno' });
   }
 });
@@ -895,7 +880,6 @@ app.post('/api/client-settings', async (req, res) => {
     const cfg = await getClientSettings(client);
     res.json({ ok: true, settings: cfg });
   } catch (err) {
-    console.error('Erro ao salvar configurações', err);
     res.status(500).json({ error: 'Erro interno' });
   }
 });
@@ -924,7 +908,6 @@ app.delete('/api/delete-client', async (req, res) => {
 
     return res.json({ status: 'ok', deleted: client });
   } catch (err) {
-    console.error('Erro ao apagar cliente', err);
     try { await pool.query('ROLLBACK'); } catch {}
     return res.status(500).json({ error: 'Erro interno ao apagar cliente' });
   }
@@ -936,10 +919,9 @@ app.delete('/api/delete-client', async (req, res) => {
  * uma conexão persistente para esta URL fornecendo o slug do cliente
  * (via query string ?client=cliente_x). Sempre que um contato for
  * processado no loop, um evento será emitido contendo os campos:
- *   { name, phone, ok, simulated, status, timestamp }
- * onde "ok" indica sucesso no envio, "simulated" sinaliza quando
- * nenhuma requisição externa foi realmente realizada (IA desativada)
- * e "status" assume "success", "error" ou "skipped".
+ *   { name, phone, ok, status, at }
+ * onde "ok" indica sucesso no envio e "status" assume "success",
+ * "error" ou "skipped".
  */
 app.get('/api/progress', (req, res) => {
   try {
@@ -975,7 +957,6 @@ app.get('/api/progress', (req, res) => {
       try { res.end(); } catch {}
     });
   } catch (err) {
-    console.error('SSE error', err);
     try { res.end(); } catch {}
   }
 });
@@ -994,7 +975,6 @@ app.post('/api/loop', async (req, res) => {
     const result = await runLoopForClient(clientSlug, { iaAutoOverride });
     return res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
   } catch (err) {
-    console.error('Erro ao executar loop manual', err);
     return res.status(500).json({ error: 'Erro interno ao executar loop' });
   }
 });
@@ -1020,14 +1000,12 @@ setInterval(async () => {
         const cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
         const queueCount = Number(cnt.rows[0].count);
         if (queueCount > 0) {
-          runLoopForClient(slug).catch((e) => console.error('Auto-run erro', slug, e));
+          runLoopForClient(slug).catch(() => {});
         }
       } catch (err) {
-        console.error('Erro ao executar loop automático para', slug, err);
       }
     }
   } catch (err) {
-    console.error('Erro no scheduler de loop automático', err);
   }
 }, LOOP_INTERVAL_MS);
 /* ======================================================================== */
