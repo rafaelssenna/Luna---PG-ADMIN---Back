@@ -63,7 +63,6 @@ function validateSlug(slug) {
 }
 
 /* ======================  Config por cliente (server-side)  ====================== */
-// Tabela: client_settings (slug PK, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, loop_status, last_run_at)
 const runningClients = new Set(); // trava por cliente (evita concorrer)
 
 /**
@@ -168,35 +167,13 @@ async function saveClientSettings(
       !!iaAuto,
       instanceUrl || null,
       instanceToken || null,
-      (instanceAuthHeader || 'token'),
-      (instanceAuthScheme ?? ''),
+      instanceAuthHeader || 'token',
+      instanceAuthScheme ?? '',
     ]
   );
 }
 
 /* ======================  IA (UAZAPI URL-ONLY FLEX) ====================== */
-/**
- * Integração flexível com UAZAPI baseada APENAS na URL da instância.
- * Suporta automaticamente:
- *  - TEMPLATE: placeholders {NUMBER}/{PHONE_E164}/{TEXT} → GET (ou POST se forçado)
- *  - QUERY: URL já contém ?number=...&text=... → GET (ou POST se forçado)
- *  - JSON: POST application/json (padrão)
- *  - FORM: POST application/x-www-form-urlencoded (se UAZAPI_PAYLOAD_STYLE=form)
- *
- * Variáveis (.env):
- *   IA_CALL=true
- *   MESSAGE_TEMPLATE="Olá {NAME}..."
- *   UAZAPI_TOKEN=...
- *   UAZAPI_AUTH_HEADER=Authorization
- *   UAZAPI_AUTH_SCHEME="Bearer "
- *   UAZAPI_PHONE_FIELD=number
- *   UAZAPI_TEXT_FIELD=text
- *   UAZAPI_PHONE_DIGITS_ONLY=true
- *   UAZAPI_PAYLOAD_STYLE=auto   # auto|json|form|query|template
- *   UAZAPI_METHOD=auto          # auto|get|post
- *   UAZAPI_EXTRA='{"instance":"x"}'
- */
-
 function normalizePhoneE164BR(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -214,7 +191,7 @@ function fillTemplate(tpl, vars) {
 const UAZ = {
   token: process.env.UAZAPI_TOKEN || '',
   authHeader: process.env.UAZAPI_AUTH_HEADER || 'Authorization',
-  authScheme: (process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer '),
+  authScheme: process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer ',
   phoneField: process.env.UAZAPI_PHONE_FIELD || 'number',
   textField: process.env.UAZAPI_TEXT_FIELD || 'text',
   digitsOnly: (process.env.UAZAPI_PHONE_DIGITS_ONLY || 'true') === 'true',
@@ -230,19 +207,16 @@ const UAZ = {
   template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
 };
 
-// HTTP genérico: usa fetch se existir; senão tenta node-fetch; senão https nativo
 async function httpSend({ url, method, headers, body }) {
   if (typeof fetch === 'function') {
     return fetch(url, { method, headers, body });
   }
   try {
-    // tente node-fetch se estiver disponível na imagem
     const nf = require('node-fetch'); // se não existir, cai no catch
     if (nf) {
       return nf(url, { method, headers, body });
     }
   } catch {}
-  // https nativo
   return new Promise((resolve, reject) => {
     try {
       const urlObj = new URL(url);
@@ -289,11 +263,8 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const style = UAZ.payloadStyle;
   const methodEnv = UAZ.methodPref;
 
-  // decide método automaticamente
-  const methodAuto =
-    methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber)) ? 'GET' : 'POST';
+  const methodAuto = methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber)) ? 'GET' : 'POST';
 
-  // TEMPLATE → substitui placeholders e usa GET (ou POST se forçado)
   if (style === 'template' || hasTpl) {
     let url = instanceUrl
       .replace(/\{NUMBER\}/g, digits)
@@ -304,12 +275,10 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     return { url, method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
-  // QUERY → preenche querystring e usa GET (ou POST se forçado)
   if (style === 'query' || hasQueryNumber) {
     const u = new URL(instanceUrl);
     u.searchParams.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
     u.searchParams.set(UAZ.textField, text);
-    // extras simples
     Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
       if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
     });
@@ -318,19 +287,15 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     return { url: u.toString(), method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
-  // FORM → POST x-www-form-urlencoded
   if (style === 'form') {
     const form = new URLSearchParams();
     form.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
     form.set(UAZ.textField, text);
-    Object.entries(UAZ.extra || {}).forEach(([k, v]) =>
-      form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v))
-    );
+    Object.entries(UAZ.extra || {}).forEach(([k, v]) => form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v)));
     const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
     return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
   }
 
-  // JSON (padrão)
   const payload = { ...UAZ.extra };
   payload[UAZ.phoneField] = UAZ.digitsOnly ? digits : e164;
   payload[UAZ.textField] = text;
@@ -338,7 +303,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
   return { url: instanceUrl, method: 'POST', headers, body: JSON.stringify(payload) };
 }
 
-// Envio "URL-only": usa token/cabeçalho do CLIENTE (override do .env)
 async function runIAForContact({
   client,
   name,
@@ -358,10 +322,8 @@ async function runIAForContact({
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
 
-    // Header/token por cliente (override do .env)
     const hdrName = (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
-    const hdrScheme =
-      (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
+    const hdrScheme = (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
     const tokenVal = (instanceToken && String(instanceToken)) || UAZ.token || '';
 
     if (tokenVal) {
@@ -369,7 +331,6 @@ async function runIAForContact({
       req.headers[hdrName] = `${hdrScheme}${tokenVal}`;
     }
 
-    // DEBUG enxuto (sem vazar o token)
     if (process.env.DEBUG === 'true') {
       console.log('[UAZAPI] request', {
         url: req.url,
@@ -409,7 +370,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
     throw new Error('Slug inválido');
   }
 
-  // trava concorrência por cliente
   if (runningClients.has(clientSlug)) {
     return { processed: 0, status: 'already_running' };
   }
@@ -418,7 +378,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
   const batchSize = parseInt(process.env.LOOP_BATCH_SIZE, 10) || opts.batchSize || 50;
 
   try {
-    // Atualiza status -> running
     await pool.query(
       `INSERT INTO client_settings (slug, loop_status, last_run_at)
        VALUES ($1, 'running', NOW())
@@ -426,10 +385,8 @@ async function runLoopForClient(clientSlug, opts = {}) {
       [clientSlug]
     );
 
-    // Verifica se a tabela de fila existe
     const exists = await tableExists(clientSlug);
     if (!exists) {
-      // Volta status -> idle
       await pool.query(
         `INSERT INTO client_settings (slug, loop_status, last_run_at)
          VALUES ($1, 'idle', NOW())
@@ -439,14 +396,12 @@ async function runLoopForClient(clientSlug, opts = {}) {
       return { processed: 0, status: 'ok' };
     }
 
-    // Obtém contagem total atual da fila para feedback
     let totalCount = 0;
     try {
       const _cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${clientSlug}";`);
       totalCount = Number(_cnt.rows?.[0]?.count || 0);
     } catch {}
 
-    // Notifica início do processamento (e salva snapshot p/ replay)
     try {
       snapshotStart(clientSlug, totalCount);
       getEmitter(clientSlug).emit('progress', {
@@ -459,19 +414,14 @@ async function runLoopForClient(clientSlug, opts = {}) {
     const settings = await getClientSettings(clientSlug);
     let processed = 0;
 
-    // Determina se a IA deve ser chamada
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
 
-    // Processa em lotes
     while (processed < batchSize) {
-      const next = await pool.query(
-        `SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`
-      );
+      const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`);
       if (next.rows.length === 0) break; // fila vazia
 
       const { name, phone } = next.rows[0];
 
-      // Chama IA (se habilitado)
       let sendRes = null;
       if (useIA) {
         sendRes = await runIAForContact({
@@ -490,14 +440,12 @@ async function runLoopForClient(clientSlug, opts = {}) {
         }
       }
 
-      // Remove da fila
       try {
         await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
       } catch (err) {
         console.error('Erro ao deletar da fila', clientSlug, phone, err);
       }
 
-      // Marca como enviada no histórico (se existir)
       try {
         await pool.query(
           `UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
@@ -509,7 +457,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
       processed++;
 
-      // Emite progresso do item + guarda em snapshot para replay
       try {
         const status = sendRes
           ? sendRes.ok === false
@@ -531,7 +478,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
       } catch {}
     }
 
-    // Volta status -> idle
     await pool.query(
       `INSERT INTO client_settings (slug, loop_status, last_run_at)
        VALUES ($1, 'idle', NOW())
@@ -539,7 +485,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
       [clientSlug]
     );
 
-    // Fim do loop: emite "end" + snapshot
     try {
       snapshotEnd(clientSlug, processed);
       getEmitter(clientSlug).emit('progress', {
@@ -551,14 +496,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
     return { processed, status: 'ok' };
   } catch (err) {
-    // Marca erro
-    await pool.query(
-      `INSERT INTO client_settings (slug, loop_status, last_run_at)
-       VALUES ($1, 'error', NOW())
-       ON CONFLICT (slug) DO UPDATE SET loop_status = 'error', last_run_at = NOW()`,
-      [clientSlug]
-    );
-    throw err;
   } finally {
     runningClients.delete(clientSlug);
   }
@@ -1140,10 +1077,8 @@ app.get('/api/progress', (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    // Envia um ping inicial para abrir o stream
     res.write(`event: ping\ndata: {}\n\n`);
 
-    // Replay do último ciclo (se existir)
     try {
       const st = progressStates.get(client);
       if (st?.lastStart) {
@@ -1158,7 +1093,6 @@ app.get('/api/progress', (req, res) => {
         res.write(`data: ${JSON.stringify(st.lastEnd)}\n\n`);
       }
     } catch (e) {
-      console.debug('progress replay error', e?.message || e);
     }
 
     const em = getEmitter(client);
@@ -1169,7 +1103,6 @@ app.get('/api/progress', (req, res) => {
     };
     em.on('progress', onProgress);
 
-    // keepalive (evita timeouts em alguns proxies)
     const ka = setInterval(() => {
       try {
         res.write(`event: ping\ndata: {}\n\n`);
@@ -1184,7 +1117,6 @@ app.get('/api/progress', (req, res) => {
       } catch {}
     });
   } catch (err) {
-    console.error('SSE error', err);
     try {
       res.end();
     } catch {}
@@ -1196,17 +1128,14 @@ app.get('*', (_req, res) => {
 });
 
 /* =====================  Loop Automático (scheduler)  ===================== */
-// Intervalo em milissegundos para executar o loop automaticamente.
-// Pode ser configurado via variável de ambiente LOOP_INTERVAL_MS (padrão: 60000ms = 1 minuto).
 const LOOP_INTERVAL_MS = parseInt(process.env.LOOP_INTERVAL_MS, 10) || 60000;
 
 setInterval(async () => {
   try {
-    // Apenas clientes com auto_run = true
     const { rows } = await pool.query(`SELECT slug FROM client_settings WHERE auto_run = true;`);
     for (const { slug } of rows) {
       try {
-        if (runningClients.has(slug)) continue; // já em execução
+        if (runningClients.has(slug)) continue;
         const exists = await tableExists(slug);
         if (!exists) continue;
         const cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
