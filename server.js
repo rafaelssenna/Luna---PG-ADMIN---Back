@@ -5,15 +5,6 @@ require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
 const EventEmitter = require('events');
-
-// Mapa de emissores de eventos por cliente utilizado para notificar
-// o front-end sobre o andamento dos envios. Cada cliente terá seu
-// próprio EventEmitter para que eventos de progresso sejam isolados
-// e consumidos apenas por assinantes interessados. Quando um envio
-// é processado pelo loop, um evento "progress" será emitido contendo
-// o nome, o telefone, o status do envio (sucesso ou erro) e um
-// timestamp. O front-end pode conectar-se via Server‑Sent Events (SSE)
-// na rota /api/progress?client=slug para receber essas atualizações.
 const multer = require('multer');
 const path = require('path');
 
@@ -75,21 +66,38 @@ function validateSlug(slug) {
 // Tabela: client_settings (slug PK, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, loop_status, last_run_at)
 const runningClients = new Set(); // trava por cliente (evita concorrer)
 
-// ============================================================================
-//  Progresso de envios (Server‑Sent Events)
-//
-//  Para fornecer feedback em tempo real sobre o andamento dos envios, cada
-//  cliente possui o seu próprio EventEmitter.  Sempre que o loop de
-//  processamento remove um contato da fila (com sucesso, erro ou simulado),
-//  um evento `progress` é emitido contendo detalhes básicos do envio.  O
-//  front-end pode se conectar à rota `/api/progress?client=<slug>` para
-//  receber esses eventos via SSE.  Além de eventos por item, enviamos
-//  mensagens de `start` (com total de contatos) e `end` (com número
-//  processado) para permitir o cálculo de barras de progresso.
+/**
+ * Emissores por cliente (SSE).
+ */
 const progressEmitters = new Map();
 function getEmitter(slug) {
   if (!progressEmitters.has(slug)) progressEmitters.set(slug, new EventEmitter());
   return progressEmitters.get(slug);
+}
+
+/**
+ * Estado de progresso (para "replay" quando o usuário abre o SSE após o início).
+ * Mantém o último "start", a cauda de até 200 "item"s e o último "end".
+ * Estrutura: { lastStart, items: [...], lastEnd }
+ */
+const progressStates = new Map();
+function snapshotStart(slug, total) {
+  progressStates.set(slug, {
+    lastStart: { type: 'start', total, at: new Date().toISOString() },
+    items: [],
+    lastEnd: null,
+  });
+}
+function snapshotPush(slug, evt) {
+  const st = progressStates.get(slug);
+  if (!st) return;
+  st.items.push(evt);
+  if (st.items.length > 200) st.items.shift();
+}
+function snapshotEnd(slug, processed) {
+  const st = progressStates.get(slug);
+  if (!st) return;
+  st.lastEnd = { type: 'end', processed, at: new Date().toISOString() };
 }
 
 async function ensureSettingsTable() {
@@ -132,7 +140,7 @@ async function getClientSettings(slug) {
       instance_auth_header: null,
       instance_auth_scheme: null,
       loop_status: 'idle',
-      last_run_at: null
+      last_run_at: null,
     };
   }
   return rows[0];
@@ -161,7 +169,7 @@ async function saveClientSettings(
       instanceUrl || null,
       instanceToken || null,
       (instanceAuthHeader || 'token'),
-      (instanceAuthScheme ?? '')
+      (instanceAuthScheme ?? ''),
     ]
   );
 }
@@ -175,10 +183,10 @@ async function saveClientSettings(
  *  - JSON: POST application/json (padrão)
  *  - FORM: POST application/x-www-form-urlencoded (se UAZAPI_PAYLOAD_STYLE=form)
  *
- * Variáveis úteis (.env):
+ * Variáveis (.env):
  *   IA_CALL=true
  *   MESSAGE_TEMPLATE="Olá {NAME}..."
- *   UAZAPI_TOKEN=
+ *   UAZAPI_TOKEN=...
  *   UAZAPI_AUTH_HEADER=Authorization
  *   UAZAPI_AUTH_SCHEME="Bearer "
  *   UAZAPI_PHONE_FIELD=number
@@ -208,11 +216,17 @@ const UAZ = {
   authHeader: process.env.UAZAPI_AUTH_HEADER || 'Authorization',
   authScheme: (process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer '),
   phoneField: process.env.UAZAPI_PHONE_FIELD || 'number',
-  textField:  process.env.UAZAPI_TEXT_FIELD  || 'text',
+  textField: process.env.UAZAPI_TEXT_FIELD || 'text',
   digitsOnly: (process.env.UAZAPI_PHONE_DIGITS_ONLY || 'true') === 'true',
   payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'auto').toLowerCase(), // auto|json|form|query|template
-  methodPref:   (process.env.UAZAPI_METHOD || 'auto').toLowerCase(),        // auto|get|post
-  extra: (() => { try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); } catch { return {}; } })(),
+  methodPref: (process.env.UAZAPI_METHOD || 'auto').toLowerCase(), // auto|get|post
+  extra: (() => {
+    try {
+      return JSON.parse(process.env.UAZAPI_EXTRA || '{}');
+    } catch {
+      return {};
+    }
+  })(),
   template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
 };
 
@@ -248,7 +262,13 @@ async function httpSend({ url, method, headers, body }) {
             resolve({
               ok: res.statusCode >= 200 && res.statusCode < 300,
               status: res.statusCode,
-              json: async () => { try { return JSON.parse(data); } catch { return { raw: data }; } },
+              json: async () => {
+                try {
+                  return JSON.parse(data);
+                } catch {
+                  return { raw: data };
+                }
+              },
               text: async () => data,
             });
           });
@@ -265,10 +285,13 @@ async function httpSend({ url, method, headers, body }) {
 
 function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
-  const hasQueryNumber = /[?&](number|phone|to)/i.test(instanceUrl);
+  const hasQueryNumber = /[?&](number|phone|to)=/i.test(instanceUrl);
   const style = UAZ.payloadStyle;
   const methodEnv = UAZ.methodPref;
-  const methodAuto = (methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber))) ? 'GET' : 'POST';
+
+  // decide método automaticamente
+  const methodAuto =
+    methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryNumber)) ? 'GET' : 'POST';
 
   // TEMPLATE → substitui placeholders e usa GET (ou POST se forçado)
   if (style === 'template' || hasTpl) {
@@ -277,7 +300,7 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
       .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
       .replace(/\{TEXT\}/g, encodeURIComponent(text));
     const method = methodEnv === 'post' ? 'POST' : 'GET';
-    const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
+    const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : {};
     return { url, method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
@@ -288,10 +311,10 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     u.searchParams.set(UAZ.textField, text);
     // extras simples
     Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
-      if (['string','number','boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
+      if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
     });
     const method = methodEnv === 'post' ? 'POST' : 'GET';
-    const headers = (method === 'POST') ? { 'Content-Type': 'application/json' } : {};
+    const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : {};
     return { url: u.toString(), method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
   }
 
@@ -300,7 +323,9 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     const form = new URLSearchParams();
     form.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
     form.set(UAZ.textField, text);
-    Object.entries(UAZ.extra || {}).forEach(([k, v]) => form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v)));
+    Object.entries(UAZ.extra || {}).forEach(([k, v]) =>
+      form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v))
+    );
     const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
     return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
   }
@@ -308,27 +333,36 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
   // JSON (padrão)
   const payload = { ...UAZ.extra };
   payload[UAZ.phoneField] = UAZ.digitsOnly ? digits : e164;
-  payload[UAZ.textField]  = text;
+  payload[UAZ.textField] = text;
   const headers = { 'Content-Type': 'application/json' };
   return { url: instanceUrl, method: 'POST', headers, body: JSON.stringify(payload) };
 }
 
 // Envio "URL-only": usa token/cabeçalho do CLIENTE (override do .env)
-async function runIAForContact({ client, name, phone, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme }) {
+async function runIAForContact({
+  client,
+  name,
+  phone,
+  instanceUrl,
+  instanceToken,
+  instanceAuthHeader,
+  instanceAuthScheme,
+}) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
 
   try {
-    const e164  = normalizePhoneE164BR(phone);
+    const e164 = normalizePhoneE164BR(phone);
     const digits = e164.replace(/\D/g, '');
-    const text  = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
+    const text = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
 
     // Header/token por cliente (override do .env)
-    const hdrName   = (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
-    const hdrScheme = (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
-    const tokenVal  = (instanceToken && String(instanceToken)) || UAZ.token || '';
+    const hdrName = (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
+    const hdrScheme =
+      (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
+    const tokenVal = (instanceToken && String(instanceToken)) || UAZ.token || '';
 
     if (tokenVal) {
       req.headers = req.headers || {};
@@ -340,13 +374,23 @@ async function runIAForContact({ client, name, phone, instanceUrl, instanceToken
       console.log('[UAZAPI] request', {
         url: req.url,
         method: req.method,
-        headers: Object.fromEntries(Object.entries(req.headers || {}).map(([k,v]) => [k, k.toLowerCase().includes('token') || k.toLowerCase().includes('authorization') ? '***' : v])),
-        hasBody: !!req.body
+        headers: Object.fromEntries(
+          Object.entries(req.headers || {}).map(([k, v]) => [
+            k,
+            k.toLowerCase().includes('token') || k.toLowerCase().includes('authorization') ? '***' : v,
+          ])
+        ),
+        hasBody: !!req.body,
       });
     }
 
     const resp = await httpSend(req);
-    let body; try { body = await resp.json(); } catch { body = await resp.text(); }
+    let body;
+    try {
+      body = await resp.json();
+    } catch {
+      body = await resp.text();
+    }
 
     if (!resp.ok) console.error('UAZAPI FAIL', { status: resp.status, body });
     return { ok: resp.ok, status: resp.status, body };
@@ -395,89 +439,97 @@ async function runLoopForClient(clientSlug, opts = {}) {
       return { processed: 0, status: 'ok' };
     }
 
+    // Obtém contagem total atual da fila para feedback
+    let totalCount = 0;
+    try {
+      const _cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${clientSlug}";`);
+      totalCount = Number(_cnt.rows?.[0]?.count || 0);
+    } catch {}
+
+    // Notifica início do processamento (e salva snapshot p/ replay)
+    try {
+      snapshotStart(clientSlug, totalCount);
+      getEmitter(clientSlug).emit('progress', {
+        type: 'start',
+        total: totalCount,
+        at: new Date().toISOString(),
+      });
+    } catch {}
+
     const settings = await getClientSettings(clientSlug);
     let processed = 0;
 
     // Determina se a IA deve ser chamada
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
 
-    // Antes de iniciar o loop, calcula o total de itens na fila e emite um evento 'start'
-    let totalCount = 0;
-    try {
-      const cntRes = await pool.query(`SELECT COUNT(*) AS count FROM "${clientSlug}";`);
-      totalCount = Number(cntRes.rows?.[0]?.count || 0);
-    } catch {}
-    try {
-      const em = getEmitter(clientSlug);
-      em.emit('progress', { type: 'start', total: totalCount, at: new Date().toISOString() });
-    } catch {}
-
     // Processa em lotes
     while (processed < batchSize) {
-      const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`);
+      const next = await pool.query(
+        `SELECT name, phone FROM "${clientSlug}" ORDER BY name LIMIT 1;`
+      );
       if (next.rows.length === 0) break; // fila vazia
 
       const { name, phone } = next.rows[0];
 
-      // Prepara resultado padrão
-      let r = { ok: true, simulated: !useIA };
-
       // Chama IA (se habilitado)
+      let sendRes = null;
       if (useIA) {
-        r = await runIAForContact({
+        sendRes = await runIAForContact({
           client: clientSlug,
           name,
           phone,
           instanceUrl: settings.instance_url,
           instanceToken: settings.instance_token,
           instanceAuthHeader: settings.instance_auth_header,
-          instanceAuthScheme: settings.instance_auth_scheme
+          instanceAuthScheme: settings.instance_auth_scheme,
         });
-        if (!r.ok) {
-          console.warn(`[${clientSlug}] IA retornou erro para ${phone}. Prosseguindo com marcação mesmo assim.`);
+        if (!sendRes.ok) {
+          console.warn(
+            `[${clientSlug}] IA retornou erro para ${phone}. Prosseguindo com marcação mesmo assim.`
+          );
         }
-      }
-
-      // Emite evento de progresso para o front-end
-      try {
-        // Define status com base no resultado: erro quando ok === false,
-        // skipped quando foi simulado (não chamou IA), success caso contrário
-        const status = r.ok === false ? 'error' : (r.simulated ? 'skipped' : 'success');
-        const em = getEmitter(clientSlug);
-        em.emit('progress', {
-          type: 'item',
-          name,
-          phone,
-          ok: status === 'success',
-          status,
-          at: new Date().toISOString(),
-        });
-      } catch (err) {
       }
 
       // Remove da fila
       try {
         await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
       } catch (err) {
+        console.error('Erro ao deletar da fila', clientSlug, phone, err);
       }
 
       // Marca como enviada no histórico (se existir)
       try {
         await pool.query(
           `UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
-          [phone],
+          [phone]
         );
       } catch (err) {
+        console.error('Erro ao atualizar histórico', clientSlug, phone, err);
       }
 
       processed++;
-    }
 
-    // Emite evento de término antes de marcar como idle
-    try {
-      const em = getEmitter(clientSlug);
-      em.emit('progress', { type: 'end', processed, at: new Date().toISOString() });
-    } catch {}
+      // Emite progresso do item + guarda em snapshot para replay
+      try {
+        const status = sendRes
+          ? sendRes.ok === false
+            ? 'error'
+            : sendRes.simulated
+            ? 'skipped'
+            : 'success'
+          : 'success';
+        const evt = {
+          type: 'item',
+          name,
+          phone,
+          ok: status === 'success',
+          status,
+          at: new Date().toISOString(),
+        };
+        snapshotPush(clientSlug, evt);
+        getEmitter(clientSlug).emit('progress', evt);
+      } catch {}
+    }
 
     // Volta status -> idle
     await pool.query(
@@ -486,6 +538,16 @@ async function runLoopForClient(clientSlug, opts = {}) {
        ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
       [clientSlug]
     );
+
+    // Fim do loop: emite "end" + snapshot
+    try {
+      snapshotEnd(clientSlug, processed);
+      getEmitter(clientSlug).emit('progress', {
+        type: 'end',
+        processed,
+        at: new Date().toISOString(),
+      });
+    } catch {}
 
     return { processed, status: 'ok' };
   } catch (err) {
@@ -520,12 +582,14 @@ function norm(s) {
 }
 function detectDelimiter(firstLine) {
   const commas = (firstLine.match(/,/g) || []).length;
-  const semis  = (firstLine.match(/;/g) || []).length;
+  const semis = (firstLine.match(/;/g) || []).length;
   return semis > commas ? ';' : ',';
 }
 function parseCSV(text, delim) {
   const rows = [];
-  let row = [], val = '', inQuotes = false;
+  let row = [],
+    val = '',
+    inQuotes = false;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '"') {
@@ -562,13 +626,31 @@ function mapHeader(headerCells) {
   const idx = { name: -1, phone: -1, niche: -1 };
   const names = headerCells.map((h) => norm(h));
   const isId = (h) => ['id', 'identificador', 'codigo', 'código'].includes(h);
-  const nameKeys  = new Set(['nome','name','full_name','fullname','contato','empresa','nomefantasia','razaosocial']);
-  const phoneKeys = new Set(['telefone','numero','número','phone','whatsapp','celular','mobile','telemovel']);
-  const nicheKeys = new Set(['nicho','niche','segmento','categoria','industry']);
+  const nameKeys = new Set([
+    'nome',
+    'name',
+    'full_name',
+    'fullname',
+    'contato',
+    'empresa',
+    'nomefantasia',
+    'razaosocial',
+  ]);
+  const phoneKeys = new Set([
+    'telefone',
+    'numero',
+    'número',
+    'phone',
+    'whatsapp',
+    'celular',
+    'mobile',
+    'telemovel',
+  ]);
+  const nicheKeys = new Set(['nicho', 'niche', 'segmento', 'categoria', 'industry']);
 
   names.forEach((h, i) => {
     if (isId(h)) return;
-    if (idx.name === -1  && nameKeys.has(h))  idx.name  = i;
+    if (idx.name === -1 && nameKeys.has(h)) idx.name = i;
     if (idx.phone === -1 && phoneKeys.has(h)) idx.phone = i;
     if (idx.niche === -1 && nicheKeys.has(h)) idx.niche = i;
   });
@@ -603,22 +685,24 @@ app.get('/api/clients', async (_req, res) => {
           pool.query(
             `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at
                FROM client_settings WHERE slug = $1;`,
-            [slug],
+            [slug]
           ),
         ]);
         const queueCount = Number(countRes.rows[0].count);
-        const autoRun = !!(cfgRes.rows[0]?.auto_run);
-        const iaAuto = !!(cfgRes.rows[0]?.ia_auto);
+        const autoRun = !!cfgRes.rows[0]?.auto_run;
+        const iaAuto = !!cfgRes.rows[0]?.ia_auto;
         const instanceUrl = cfgRes.rows[0]?.instance_url || null;
         const loopStatus = cfgRes.rows[0]?.loop_status || 'idle';
         const lastRunAt = cfgRes.rows[0]?.last_run_at || null;
         clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt });
       } catch (innerErr) {
+        console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
       }
     }
     res.json(clients);
   } catch (err) {
+    console.error('Erro ao listar clientes', err);
     res.status(500).json({ error: 'Erro interno ao listar clientes' });
   }
 });
@@ -633,11 +717,12 @@ app.post('/api/clients', async (req, res) => {
     await pool.query('SELECT create_full_client_structure($1);', [slug]);
     res.status(201).json({ message: 'Cliente criado com sucesso' });
   } catch (err) {
+    console.error('Erro ao criar cliente', err);
     res.status(500).json({ error: 'Erro interno ao criar cliente' });
   }
 });
 
-/** KPIs (blindado) */
+/** KPIs (inclui info do último envio) */
 app.get('/api/stats', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) {
@@ -653,7 +738,12 @@ app.get('/api/stats', async (req, res) => {
       tableExists(totaisTable),
     ]);
 
-    let totais = 0, enviados = 0, fila = 0;
+    let totais = 0,
+      enviados = 0,
+      fila = 0,
+      lastSentAt = null,
+      lastSentName = null,
+      lastSentPhone = null;
 
     if (hasTotais) {
       const r = await pool.query(
@@ -661,8 +751,22 @@ app.get('/api/stats', async (req, res) => {
            (SELECT COUNT(*) FROM "${totaisTable}") AS totais,
            (SELECT COUNT(*) FROM "${totaisTable}" WHERE mensagem_enviada = true) AS enviados;`
       );
-      totais   = Number(r.rows[0].totais);
+      totais = Number(r.rows[0].totais);
       enviados = Number(r.rows[0].enviados);
+
+      // último envio (para HUD)
+      const r3 = await pool.query(
+        `SELECT name, phone, updated_at
+           FROM "${totaisTable}"
+          WHERE mensagem_enviada = true
+          ORDER BY updated_at DESC
+          LIMIT 1;`
+      );
+      if (r3.rows[0]) {
+        lastSentAt = r3.rows[0].updated_at;
+        lastSentName = r3.rows[0].name;
+        lastSentPhone = r3.rows[0].phone;
+      }
     }
     if (hasFila) {
       const r2 = await pool.query(`SELECT COUNT(*) AS fila FROM "${filaTable}";`);
@@ -674,8 +778,12 @@ app.get('/api/stats', async (req, res) => {
       enviados,
       pendentes: totais - enviados,
       fila,
+      last_sent_at: lastSentAt,
+      last_sent_name: lastSentName,
+      last_sent_phone: lastSentPhone,
     });
   } catch (err) {
+    console.error('Erro ao obter estatísticas', err);
     res.status(500).json({ error: 'Erro interno ao obter estatísticas' });
   }
 });
@@ -716,7 +824,53 @@ app.get('/api/queue', async (req, res) => {
     const total = Number(countRes.rows[0].total);
     res.json({ items, total });
   } catch (err) {
+    console.error('Erro ao consultar fila', err);
     res.status(500).json({ error: 'Erro interno ao consultar fila' });
+  }
+});
+
+/** Remoção/Marcação manual a partir da Fila (usado pelos botões do front) */
+app.delete('/api/queue', async (req, res) => {
+  try {
+    const client = req.body?.client;
+    const phone = req.body?.phone;
+    const markSent = !!req.body?.markSent;
+
+    if (!client || !validateSlug(client) || !phone) {
+      return res.status(400).json({ error: 'Parâmetros inválidos' });
+    }
+
+    await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
+
+    let name = null;
+    if (markSent) {
+      await pool.query(
+        `UPDATE "${client}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
+        [phone]
+      );
+      const nm = await pool.query(
+        `SELECT name FROM "${client}_totais" WHERE phone = $1 ORDER BY updated_at DESC LIMIT 1;`,
+        [phone]
+      );
+      name = nm.rows[0]?.name || null;
+    }
+
+    // Dispara um evento de progresso "simulado" para refletir ação manual
+    const evt = {
+      type: 'item',
+      name: name || '-',
+      phone,
+      ok: !!markSent,
+      status: markSent ? 'success' : 'skipped',
+      at: new Date().toISOString(),
+    };
+    snapshotPush(client, evt);
+    getEmitter(client).emit('progress', evt);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Erro em DELETE /api/queue', err);
+    return res.status(500).json({ error: 'Erro interno' });
   }
 });
 
@@ -766,6 +920,7 @@ app.get('/api/totals', async (req, res) => {
     const total = Number(countRes.rows[0].total);
     res.json({ items, total });
   } catch (err) {
+    console.error('Erro ao consultar totais', err);
     res.status(500).json({ error: 'Erro interno ao consultar totais' });
   }
 });
@@ -788,6 +943,7 @@ app.post('/api/contacts', async (req, res) => {
     res.json({ status });
   } catch (err) {
     if (err.code === '23505') return res.json({ status: 'skipped_conflict' });
+    console.error('Erro ao adicionar contato', err);
     res.status(500).json({ error: 'Erro interno ao adicionar contato' });
   }
 });
@@ -804,7 +960,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     }
 
     const text = req.file.buffer.toString('utf8');
-    const firstLine = (text.split(/\r?\n/)[0] || '');
+    const firstLine = text.split(/\r?\n/)[0] || '';
     const delim = detectDelimiter(firstLine);
     const rows = parseCSV(text, delim);
 
@@ -816,7 +972,9 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Cabeçalho inválido. Precisa conter colunas de nome e telefone.' });
     }
 
-    let inserted = 0, skipped = 0, errors = 0;
+    let inserted = 0,
+      skipped = 0,
+      errors = 0;
 
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
@@ -825,20 +983,30 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       const phone = (r[idx.phone] || '').toString().trim();
       const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
 
-      if (!name || !phone) { skipped++; continue; }
+      if (!name || !phone) {
+        skipped++;
+        continue;
+      }
 
       try {
-        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, name, phone, niche]);
+        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [
+          slug,
+          name,
+          phone,
+          niche,
+        ]);
         const status = q.rows[0]?.status || 'inserted';
         if (status === 'inserted') inserted++;
         else skipped++;
       } catch (e) {
+        console.error('Erro linha CSV', i, e);
         errors++;
       }
     }
 
     res.json({ inserted, skipped, errors });
   } catch (err) {
+    console.error('Erro no import CSV', err);
     res.status(500).json({ error: 'Erro interno ao importar CSV' });
   }
 });
@@ -862,24 +1030,45 @@ app.get('/api/client-settings', async (req, res) => {
       lastRunAt: cfg.last_run_at || null,
     });
   } catch (err) {
+    console.error('Erro ao obter configurações', err);
     res.status(500).json({ error: 'Erro interno' });
   }
 });
 
 /** Salva configurações do cliente (inclui token/header/scheme) */
 app.post('/api/client-settings', async (req, res) => {
-  const { client, autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme } = req.body || {};
+  const {
+    client,
+    autoRun,
+    iaAuto,
+    instanceUrl,
+    instanceToken,
+    instanceAuthHeader,
+    instanceAuthScheme,
+  } = req.body || {};
   if (!client || !validateSlug(client)) {
     return res.status(400).json({ error: 'Cliente inválido' });
   }
   try {
     if (instanceUrl) {
-      try { new URL(instanceUrl); } catch { return res.status(400).json({ error: 'instanceUrl inválida' }); }
+      try {
+        new URL(instanceUrl);
+      } catch {
+        return res.status(400).json({ error: 'instanceUrl inválida' });
+      }
     }
-    await saveClientSettings(client, { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme });
+    await saveClientSettings(client, {
+      autoRun,
+      iaAuto,
+      instanceUrl,
+      instanceToken,
+      instanceAuthHeader,
+      instanceAuthScheme,
+    });
     const cfg = await getClientSettings(client);
     res.json({ ok: true, settings: cfg });
   } catch (err) {
+    console.error('Erro ao salvar configurações', err);
     res.status(500).json({ error: 'Erro interno' });
   }
 });
@@ -908,56 +1097,11 @@ app.delete('/api/delete-client', async (req, res) => {
 
     return res.json({ status: 'ok', deleted: client });
   } catch (err) {
-    try { await pool.query('ROLLBACK'); } catch {}
+    console.error('Erro ao apagar cliente', err);
+    try {
+      await pool.query('ROLLBACK');
+    } catch {}
     return res.status(500).json({ error: 'Erro interno ao apagar cliente' });
-  }
-});
-
-/**
- * Rota de Server‑Sent Events (SSE) para notificar sobre o andamento
- * dos envios de um cliente em tempo real. O front-end pode abrir
- * uma conexão persistente para esta URL fornecendo o slug do cliente
- * (via query string ?client=cliente_x). Sempre que um contato for
- * processado no loop, um evento será emitido contendo os campos:
- *   { name, phone, ok, status, at }
- * onde "ok" indica sucesso no envio e "status" assume "success",
- * "error" ou "skipped".
- */
-app.get('/api/progress', (req, res) => {
-  try {
-    const client = req.query?.client;
-    if (!client || !validateSlug(client)) {
-      return res.status(400).json({ error: 'Cliente inválido' });
-    }
-    // Configura cabeçalhos para SSE
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    // Indica ao Nginx/Proxy para não fazer buffering
-    res.setHeader('X-Accel-Buffering', 'no');
-    if (typeof res.flushHeaders === 'function') {
-      try { res.flushHeaders(); } catch {}
-    }
-    // Envia um ping inicial para abrir o stream
-    res.write(`event: ping\ndata: {}\n\n`);
-    // Mantém conexão viva com pings periódicos
-    const keepAlive = setInterval(() => {
-      try { res.write(':ka\n\n'); } catch {}
-    }, 15000);
-    const em = getEmitter(client);
-    const handler = (payload) => {
-      try {
-        res.write('data: ' + JSON.stringify(payload) + '\n\n');
-      } catch {}
-    };
-    em.on('progress', handler);
-    req.on('close', () => {
-      clearInterval(keepAlive);
-      em.off('progress', handler);
-      try { res.end(); } catch {}
-    });
-  } catch (err) {
-    try { res.end(); } catch {}
   }
 });
 
@@ -973,9 +1117,77 @@ app.post('/api/loop', async (req, res) => {
   }
   try {
     const result = await runLoopForClient(clientSlug, { iaAutoOverride });
-    return res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
+    return res.json({
+      message: 'Loop executado',
+      processed: result.processed,
+      status: result.status || 'ok',
+    });
   } catch (err) {
+    console.error('Erro ao executar loop manual', err);
     return res.status(500).json({ error: 'Erro interno ao executar loop' });
+  }
+});
+
+/** SSE de progresso por cliente (com replay do último estado) */
+app.get('/api/progress', (req, res) => {
+  try {
+    const client = req.query?.client;
+    if (!client || !validateSlug(client)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    // Envia um ping inicial para abrir o stream
+    res.write(`event: ping\ndata: {}\n\n`);
+
+    // Replay do último ciclo (se existir)
+    try {
+      const st = progressStates.get(client);
+      if (st?.lastStart) {
+        res.write(`data: ${JSON.stringify(st.lastStart)}\n\n`);
+      }
+      if (st?.items?.length) {
+        for (const it of st.items) {
+          res.write(`data: ${JSON.stringify(it)}\n\n`);
+        }
+      }
+      if (st?.lastEnd) {
+        res.write(`data: ${JSON.stringify(st.lastEnd)}\n\n`);
+      }
+    } catch (e) {
+      console.debug('progress replay error', e?.message || e);
+    }
+
+    const em = getEmitter(client);
+    const onProgress = (payload) => {
+      try {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      } catch {}
+    };
+    em.on('progress', onProgress);
+
+    // keepalive (evita timeouts em alguns proxies)
+    const ka = setInterval(() => {
+      try {
+        res.write(`event: ping\ndata: {}\n\n`);
+      } catch {}
+    }, 15000);
+
+    req.on('close', () => {
+      em.off('progress', onProgress);
+      clearInterval(ka);
+      try {
+        res.end();
+      } catch {}
+    });
+  } catch (err) {
+    console.error('SSE error', err);
+    try {
+      res.end();
+    } catch {}
   }
 });
 
@@ -1000,12 +1212,14 @@ setInterval(async () => {
         const cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
         const queueCount = Number(cnt.rows[0].count);
         if (queueCount > 0) {
-          runLoopForClient(slug).catch(() => {});
+          runLoopForClient(slug).catch((e) => console.error('Auto-run erro', slug, e));
         }
       } catch (err) {
+        console.error('Erro ao executar loop automático para', slug, err);
       }
     }
   } catch (err) {
+    console.error('Erro no scheduler de loop automático', err);
   }
 }, LOOP_INTERVAL_MS);
 /* ======================================================================== */
