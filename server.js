@@ -8,10 +8,11 @@ const { Pool } = require('pg');
 const EventEmitter = require('events');
 const multer = require('multer');
 const path = require('path');
+
 const app = express();
 
 /* ======================  Janela e cota diária  ====================== */
-// até 30 mensagens por dia, janela 08:00–17:30
+// Até 30 mensagens por dia, janela 08:00–17:30
 const DAILY_MESSAGE_COUNT = 30;
 const DAILY_START_TIME = '08:00:00';
 const DAILY_END_TIME = '17:30:00';
@@ -27,7 +28,7 @@ function hmsToSeconds(hms) {
 
 /**
  * Gera delays (em segundos) para envios entre start e end, a partir de "agora".
- * Primeiro delay inclui o tempo até o início efetivo (se necessário).
+ * O primeiro delay inclui o tempo até o início efetivo (se necessário).
  */
 function generateScheduleDelays(count, startStr, endStr) {
   const now = new Date();
@@ -35,25 +36,27 @@ function generateScheduleDelays(count, startStr, endStr) {
   const startSec = hmsToSeconds(startStr);
   const endSec = hmsToSeconds(endStr);
 
+  // início efetivo: se já passou do início, começa agora; senão, aguarda até o início
   const effectiveStart = Math.max(nowSec, startSec);
+
+  // se já passou do término, sem tempo para hoje
   if (endSec <= effectiveStart) return [];
 
   const span = endSec - effectiveStart;
   const msgCount = Math.min(count, span);
 
+  // offsets aleatórios e ordenados
   const offsets = new Set();
-  while (offsets.size < msgCount) {
-    offsets.add(Math.floor(Math.random() * (span + 1)));
-  }
+  while (offsets.size < msgCount) offsets.add(Math.floor(Math.random() * (span + 1)));
   const sortedOffsets = Array.from(offsets).sort((a, b) => a - b);
 
   const delays = [];
-  let prevOffset = 0;
+  let prev = 0;
   for (let i = 0; i < sortedOffsets.length; i++) {
     const off = sortedOffsets[i];
     if (i === 0) delays.push((effectiveStart - nowSec) + off);
-    else delays.push(off - prevOffset);
-    prevOffset = off;
+    else delays.push(off - prev);
+    prev = off;
   }
   return delays;
 }
@@ -70,8 +73,11 @@ app.use((req, res, next) => {
   if (CORS_ANY) {
     res.setHeader('Access-Control-Allow-Origin', origin || '*');
   } else if (CORS_ORIGINS.length > 0) {
-    if (origin && CORS_ORIGINS.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
-    else res.setHeader('Access-Control-Allow-Origin', '*');
+    if (origin && CORS_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
@@ -81,11 +87,12 @@ app.use((req, res, next) => {
     'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization, token'
   );
+  // res.setHeader('Access-Control-Allow-Credentials', 'true');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
-/* ======================  DB  ====================== */
+/* ======================  Banco de Dados  ====================== */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
@@ -94,7 +101,7 @@ const pool = new Pool({
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
-/* ======================  Compat: aceitar endpoints sem /api  ====================== */
+/* ======================  Compat: endpoints sem /api  ====================== */
 const COMPAT_ENDPOINTS = new Set([
   'clients',
   'client-settings',
@@ -109,6 +116,7 @@ const COMPAT_ENDPOINTS = new Set([
   'healthz',
   'quota',
 ]);
+
 app.use((req, _res, next) => {
   const seg = (req.path || '').replace(/^\/+/, '').split('/')[0];
   if (seg && COMPAT_ENDPOINTS.has(seg) && !req.path.startsWith('/api/')) {
@@ -118,9 +126,12 @@ app.use((req, _res, next) => {
 });
 
 const upload = multer({ storage: multer.memoryStorage() });
-function validateSlug(slug) { return /^cliente_[a-z0-9_]+$/.test(slug); }
 
-/* ======================  Estado por cliente (SSE)  ====================== */
+function validateSlug(slug) {
+  return /^cliente_[a-z0-9_]+$/.test(slug);
+}
+
+/* ======================  Estado e SSE por cliente  ====================== */
 const runningClients = new Set();
 const progressEmitters = new Map();
 function getEmitter(slug) {
@@ -129,7 +140,11 @@ function getEmitter(slug) {
 }
 const progressStates = new Map();
 function snapshotStart(slug, total) {
-  progressStates.set(slug, { lastStart: { type: 'start', total, at: new Date().toISOString() }, items: [], lastEnd: null });
+  progressStates.set(slug, {
+    lastStart: { type: 'start', total, at: new Date().toISOString() },
+    items: [],
+    lastEnd: null,
+  });
 }
 function snapshotPush(slug, evt) {
   const st = progressStates.get(slug);
@@ -137,13 +152,13 @@ function snapshotPush(slug, evt) {
   st.items.push(evt);
   if (st.items.length > 200) st.items.shift();
 }
-function snapshotEnd(slug, processed) {
+function snapshotEnd(slug, processed, extra = {}) {
   const st = progressStates.get(slug);
   if (!st) return;
-  st.lastEnd = { type: 'end', processed, at: new Date().toISOString() };
+  st.lastEnd = { type: 'end', processed, ...extra, at: new Date().toISOString() };
 }
 
-/* ======================  Tabela de settings  ====================== */
+/* ======================  Tabela de settings por cliente  ====================== */
 async function ensureSettingsTable() {
   await pool.query(`
 CREATE TABLE IF NOT EXISTS client_settings (
@@ -170,14 +185,20 @@ async function getClientSettings(slug) {
   const { rows } = await pool.query(
     `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at,
             instance_token, instance_auth_header, instance_auth_scheme
-       FROM client_settings WHERE slug = $1`,
+       FROM client_settings
+      WHERE slug = $1`,
     [slug]
   );
   if (!rows.length) {
     return {
-      auto_run: false, ia_auto: false, instance_url: null,
-      instance_token: null, instance_auth_header: null, instance_auth_scheme: null,
-      loop_status: 'idle', last_run_at: null,
+      auto_run: false,
+      ia_auto: false,
+      instance_url: null,
+      instance_token: null,
+      instance_auth_header: null,
+      instance_auth_scheme: null,
+      loop_status: 'idle',
+      last_run_at: null,
     };
   }
   return rows[0];
@@ -200,7 +221,9 @@ async function saveClientSettings(
        instance_auth_header = EXCLUDED.instance_auth_header,
        instance_auth_scheme = EXCLUDED.instance_auth_scheme`,
     [
-      slug, !!autoRun, !!iaAuto,
+      slug,
+      !!autoRun,
+      !!iaAuto,
       instanceUrl || null,
       instanceToken || null,
       instanceAuthHeader || 'token',
@@ -209,7 +232,11 @@ async function saveClientSettings(
   );
 }
 
-/* ======================  Integração UAZAPI  ====================== */
+/* ======================  IA (UAZAPI) ====================== */
+/**
+ * Normaliza número para E.164 BR como **string** com '+'
+ * Ex.: "31999999999" -> "+5531999999999" | "553199..." -> "+553199..."
+ */
 function normalizePhoneE164BR(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -227,29 +254,118 @@ function fillTemplate(tpl, vars) {
 
 const UAZ = {
   token: process.env.UAZAPI_TOKEN || '',
-  authHeader: process.env.UAZAPI_AUTH_HEADER || 'Authorization',
-  authScheme: process.env.UAZAPI_AUTH_SCHEME ?? 'Bearer ',
-  phoneField: process.env.UAZAPI_PHONE_FIELD || 'phone',   // <<< padrão: phone
-  textField: process.env.UAZAPI_TEXT_FIELD || 'message',   // <<< padrão: message
+  authHeader: process.env.UAZAPI_AUTH_HEADER || 'token',           // UAZAPI padrão aceita 'token'
+  authScheme: process.env.UAZAPI_AUTH_SCHEME ?? '',                // geralmente vazio
+  phoneField: process.env.UAZAPI_PHONE_FIELD || 'phone',           // DOC: phone
+  textField: process.env.UAZAPI_TEXT_FIELD || 'message',           // DOC: message
   digitsOnly: (process.env.UAZAPI_PHONE_DIGITS_ONLY || 'true') === 'true',
-  payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'json').toLowerCase(), // auto|json|form|query|template
-  methodPref: (process.env.UAZAPI_METHOD || 'post').toLowerCase(),          // auto|get|post
-  extra: (() => { try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); } catch { return {}; } })(),
+  payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'json').toLowerCase(), // json|form|query|template|auto
+  methodPref: (process.env.UAZAPI_METHOD || 'post').toLowerCase(),          // post|get|auto
+  extra: (() => {
+    try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); }
+    catch { return {}; }
+  })(),
   template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
 };
 
+/**
+ * Monta a request para UAZAPI de forma segura:
+ * - POST → envia JSON { phone, message } no **corpo** (evita "Missing required fields")
+ * - GET  → usa querystring (somente para cenários template/query)
+ */
+function buildUazRequest(instanceUrl, { e164, digits, text }) {
+  const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
+  const hasQueryParams = /\?[^#]*=/.test(instanceUrl);
+  const style = UAZ.payloadStyle;
+  const methodEnv = UAZ.methodPref;
+
+  const decideMethod = () => {
+    if (methodEnv === 'get') return 'GET';
+    if (methodEnv === 'post') return 'POST';
+    return (hasTpl || hasQueryParams) ? 'GET' : 'POST'; // auto
+  };
+
+  const method = decideMethod();
+  const phoneValue = UAZ.digitsOnly ? digits : e164;
+
+  const makeJson = () => {
+    const payload = { ...UAZ.extra };
+    payload[UAZ.phoneField] = phoneValue;
+    payload[UAZ.textField] = text;
+    return {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    };
+  };
+
+  // 1) URL templateda
+  if (style === 'template' || hasTpl) {
+    if (method === 'GET') {
+      const url = instanceUrl
+        .replace(/\{NUMBER\}/g, digits)
+        .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
+        .replace(/\{TEXT\}/g, encodeURIComponent(text));
+      return { url, method: 'GET' };
+    }
+    // POST com body JSON (limpa query se houver)
+    let cleanUrl;
+    try { const u = new URL(instanceUrl); cleanUrl = u.origin + u.pathname; }
+    catch { cleanUrl = instanceUrl.split('?')[0]; }
+    const j = makeJson();
+    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
+  }
+
+  // 2) URL com query (?a=b). Em POST, alguns gateways ignoram a query → manda JSON no corpo.
+  if (style === 'query' || (hasQueryParams && style === 'auto')) {
+    const u = new URL(instanceUrl);
+    if (method === 'GET') {
+      u.searchParams.set(UAZ.phoneField, phoneValue);
+      u.searchParams.set(UAZ.textField, text);
+      Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
+        if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
+      });
+      return { url: u.toString(), method: 'GET' };
+    }
+    // POST: envia no corpo
+    const cleanUrl = u.origin + u.pathname;
+    const j = makeJson();
+    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
+  }
+
+  // 3) FORM
+  if (style === 'form') {
+    const form = new URLSearchParams();
+    Object.entries(UAZ.extra || {}).forEach(([k, v]) =>
+      form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v))
+    );
+    form.set(UAZ.phoneField, phoneValue);
+    form.set(UAZ.textField, text);
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
+  }
+
+  // 4) JSON (default)
+  const j = makeJson();
+  return { url: instanceUrl, method: 'POST', headers: j.headers, body: j.body };
+}
+
 async function httpSend({ url, method, headers, body }) {
-  if (typeof fetch === 'function') return fetch(url, { method, headers, body });
-  try { const nf = require('node-fetch'); if (nf) return nf(url, { method, headers, body }); } catch {}
+  if (typeof fetch === 'function') {
+    return fetch(url, { method, headers, body });
+  }
+  try {
+    const nf = require('node-fetch');
+    if (nf) return nf(url, { method, headers, body });
+  } catch {}
   return new Promise((resolve, reject) => {
     try {
-      const urlObj = new URL(url);
-      const httpMod = urlObj.protocol === 'https:' ? require('https') : require('http');
+      const URLmod = new URL(url);
+      const httpMod = URLmod.protocol === 'https:' ? require('https') : require('http');
       const req = httpMod.request(
         {
-          hostname: urlObj.hostname,
-          port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-          path: urlObj.pathname + urlObj.search,
+          hostname: URLmod.hostname,
+          port: URLmod.port || (URLmod.protocol === 'https:' ? 443 : 80),
+          path: URLmod.pathname + URLmod.search,
           method: method || 'GET',
           headers: headers || {},
         },
@@ -269,95 +385,24 @@ async function httpSend({ url, method, headers, body }) {
       req.on('error', reject);
       if (body) req.write(body);
       req.end();
-    } catch (err) { reject(err); }
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
-/**
- * Estratégia:
- * - GET: usa querystring (template/query).
- * - POST: remove qualquer query e envia JSON com UAZ.phoneField/UAZ.textField (+extra).
- */
-function buildUazRequest(instanceUrl, { e164, digits, text }) {
-  const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
-  const hasQueryParams = /\?[^#]*=/.test(instanceUrl);
-  const style = UAZ.payloadStyle;
-  const methodEnv = UAZ.methodPref;
-
-  const decideMethod = () => {
-    if (methodEnv === 'get') return 'GET';
-    if (methodEnv === 'post') return 'POST';
-    // auto:
-    return (hasTpl || hasQueryParams) ? 'GET' : 'POST';
-  };
-  const method = decideMethod();
-  const phoneValue = UAZ.digitsOnly ? digits : e164;
-
-  const makeJson = () => {
-    const payload = { ...UAZ.extra };
-    payload[UAZ.phoneField] = phoneValue;
-    payload[UAZ.textField] = text;
-    return { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
-  };
-
-  // 1) template placeholders na URL
-  if (style === 'template' || hasTpl) {
-    if (method === 'GET') {
-      const url = instanceUrl
-        .replace(/\{NUMBER\}/g, digits)
-        .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
-        .replace(/\{TEXT\}/g, encodeURIComponent(text));
-      return { url, method: 'GET', headers: {}, body: undefined };
-    }
-    // POST com JSON (limpa query/path parametrizada)
-    let cleanUrl;
-    try { const u = new URL(instanceUrl); cleanUrl = u.origin + u.pathname; }
-    catch { cleanUrl = instanceUrl.split('?')[0]; }
-    const j = makeJson();
-    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
-  }
-
-  // 2) URL já com query (?phone=&message=)
-  if (style === 'query' || hasQueryParams) {
-    const u = new URL(instanceUrl);
-    if (method === 'GET') {
-      u.searchParams.set(UAZ.phoneField, phoneValue);
-      u.searchParams.set(UAZ.textField, text);
-      Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
-        if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
-      });
-      return { url: u.toString(), method: 'GET', headers: {}, body: undefined };
-    }
-    // POST: limpa query e envia JSON
-    const cleanUrl = u.origin + u.pathname;
-    const j = makeJson();
-    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
-  }
-
-  // 3) FORM
-  if (style === 'form') {
-    const form = new URLSearchParams();
-    form.set(UAZ.phoneField, phoneValue);
-    form.set(UAZ.textField, text);
-    Object.entries(UAZ.extra || {}).forEach(([k, v]) => form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v)));
-    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-    return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
-  }
-
-  // 4) JSON (default)
-  const payload = { ...UAZ.extra };
-  payload[UAZ.phoneField] = phoneValue;
-  payload[UAZ.textField] = text;
-  const headers = { 'Content-Type': 'application/json' };
-  const cleanUrlDefault = instanceUrl.split('?')[0]; // garante URL "limpa"
-  return { url: cleanUrlDefault, method: 'POST', headers, body: JSON.stringify(payload) };
-}
-
 async function runIAForContact({
-  client, name, phone, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme,
+  client,
+  name,
+  phone,
+  instanceUrl,
+  instanceToken,
+  instanceAuthHeader,
+  instanceAuthScheme,
 }) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
+
   try {
     const e164 = normalizePhoneE164BR(phone);
     const digits = String(e164).replace(/\D/g, '');
@@ -365,8 +410,11 @@ async function runIAForContact({
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
 
-    const hdrName = (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
-    const hdrScheme = (instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme) || '';
+    // Header de autenticação (token, por padrão)
+    const hdrName =
+      (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
+    const hdrScheme =
+      instanceAuthScheme !== undefined ? instanceAuthScheme : UAZ.authScheme || '';
     const tokenVal = (instanceToken && String(instanceToken)) || UAZ.token || '';
     if (tokenVal) {
       req.headers = req.headers || {};
@@ -374,27 +422,26 @@ async function runIAForContact({
     }
 
     if (process.env.DEBUG === 'true') {
-      const safeHeaders = Object.fromEntries(
+      const maskedHeaders = Object.fromEntries(
         Object.entries(req.headers || {}).map(([k, v]) => [
           k,
           k.toLowerCase().includes('token') || k.toLowerCase().includes('authorization') ? '***' : v,
         ])
       );
-      let previewBody = undefined;
-      if (req.body && typeof req.body === 'string') {
-        try {
-          const b = JSON.parse(req.body);
-          previewBody = { ...b, [UAZ.phoneField]: '***masked***', [UAZ.textField]: (b[UAZ.textField] || '').slice(0, 40) + '...' };
-        } catch { previewBody = '<<non-json>>'; }
-      }
-      console.log('[UAZAPI] request', { url: req.url, method: req.method, headers: safeHeaders, hasBody: !!req.body, bodyPreview: previewBody });
+      console.log('[UAZAPI] request', {
+        url: req.url,
+        method: req.method,
+        headers: maskedHeaders,
+        hasBody: !!req.body,
+      });
     }
 
     const resp = await httpSend(req);
     let body;
-    try { body = await resp.json(); }
-    catch { body = await resp.text(); }
-    if (!resp.ok) console.error('UAZAPI FAIL', { status: resp.status, body });
+    try { body = await resp.json(); } catch { body = await resp.text(); }
+    if (!resp.ok) {
+      console.error('UAZAPI FAIL', { status: resp.status, body });
+    }
     return { ok: resp.ok, status: resp.status, body };
   } catch (err) {
     console.error('UAZAPI ERROR', instanceUrl, err);
@@ -402,176 +449,19 @@ async function runIAForContact({
   }
 }
 
-/* ======================  Helpers de DB  ====================== */
+/* ======================  Helpers  ====================== */
 async function tableExists(tableName) {
   const { rows } = await pool.query('SELECT to_regclass($1) AS reg;', [`public.${tableName}`]);
   return !!rows[0].reg;
 }
 
-/* ======================  Loop principal por cliente  ====================== */
-async function runLoopForClient(clientSlug, opts = {}) {
-  if (!validateSlug(clientSlug)) throw new Error('Slug inválido');
-  if (runningClients.has(clientSlug)) return { processed: 0, status: 'already_running' };
-  runningClients.add(clientSlug);
-
-  const batchSize = parseInt(process.env.LOOP_BATCH_SIZE, 10) || opts.batchSize || DAILY_MESSAGE_COUNT;
-
-  try {
-    await pool.query(
-      `INSERT INTO client_settings (slug, loop_status, last_run_at)
-       VALUES ($1, 'running', NOW())
-       ON CONFLICT (slug) DO UPDATE SET loop_status = 'running', last_run_at = NOW()`,
-      [clientSlug]
-    );
-
-    const exists = await tableExists(clientSlug);
-    if (!exists) {
-      await pool.query(
-        `INSERT INTO client_settings (slug, loop_status, last_run_at)
-         VALUES ($1, 'idle', NOW())
-         ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
-        [clientSlug]
-      );
-      return { processed: 0, status: 'ok' };
-    }
-
-    let totalCount = 0;
-    try {
-      const _cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${clientSlug}";`);
-      totalCount = Number(_cnt.rows?.[0]?.count || 0);
-    } catch {}
-
-    // Início (SSE)
-    try {
-      snapshotStart(clientSlug, totalCount);
-      getEmitter(clientSlug).emit('progress', { type: 'start', total: totalCount, at: new Date().toISOString() });
-    } catch {}
-
-    const settings = await getClientSettings(clientSlug);
-    let processed = 0;
-    const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
-
-    // Cota diária
-    let alreadySentToday = 0;
-    try {
-      const sentTodayRes = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM "${clientSlug}_totais"
-         WHERE mensagem_enviada = true AND updated_at::date = CURRENT_DATE;`
-      );
-      alreadySentToday = Number(sentTodayRes.rows?.[0]?.c || 0);
-      console.log(`[${clientSlug}] Enviadas hoje: ${alreadySentToday}/${DAILY_MESSAGE_COUNT}`);
-    } catch (e) {
-      console.warn(`[${clientSlug}] Falha ao contar envios de hoje`, e);
-    }
-    const remainingToday = Math.max(0, DAILY_MESSAGE_COUNT - alreadySentToday);
-    if (remainingToday <= 0) {
-      console.log(`[${clientSlug}] Cota diária (${DAILY_MESSAGE_COUNT}) atingida. Encerrando.`);
-      try {
-        snapshotEnd(clientSlug, processed);
-        getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString(), reason: 'daily_quota' });
-      } catch {}
-      await pool.query(`UPDATE client_settings SET loop_status='idle', last_run_at=NOW() WHERE slug=$1;`, [clientSlug]);
-      return { processed, status: 'quota_reached' };
-    }
-
-    // Grade de horários
-    const scheduleDelays = generateScheduleDelays(DAILY_MESSAGE_COUNT, DAILY_START_TIME, DAILY_END_TIME);
-    const messageLimit = Math.min(batchSize, scheduleDelays.length);
-    const planCount = Math.min(messageLimit, remainingToday);
-    try {
-      let acc = 0;
-      const planned = [];
-      for (let i = 0; i < planCount; i++) { acc += scheduleDelays[i]; planned.push(new Date(Date.now() + acc * 1000).toISOString()); }
-      getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
-    } catch {}
-
-    // Evitar repetir o mesmo telefone no mesmo ciclo
-    const attemptedPhones = new Set();
-
-    for (let i = 0; i < messageLimit; i++) {
-      if (i >= remainingToday) { console.log(`[${clientSlug}] Cota diária atingida durante o ciclo. Encerrando.`); break; }
-
-      const delaySec = scheduleDelays[i];
-      if (delaySec > 0) {
-        const when = new Date(Date.now() + delaySec * 1000);
-        console.log(`[${clientSlug}] Aguardando ${delaySec}s (${when.toTimeString().split(' ')[0]}) para enviar a mensagem ${i + 1}/${messageLimit}.`);
-        await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
-      }
-
-      // Seleciona próximo contato (ignora os já tentados)
-      let whereNotIn = '';
-      let params = [];
-      if (attemptedPhones.size) {
-        const arr = Array.from(attemptedPhones);
-        const ph = arr.map((_, idx) => `$${idx + 1}`).join(',');
-        whereNotIn = `WHERE phone NOT IN (${ph})`;
-        params = arr;
-      }
-      const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
-      if (next.rows.length === 0) break;
-
-      const { name, phone } = next.rows[0];
-      attemptedPhones.add(phone);
-
-      let sendRes = null;
-      if (useIA) {
-        sendRes = await runIAForContact({
-          client: clientSlug,
-          name,
-          phone,
-          instanceUrl: settings.instance_url,
-          instanceToken: settings.instance_token,
-          instanceAuthHeader: settings.instance_auth_header,
-          instanceAuthScheme: settings.instance_auth_scheme,
-        });
-        if (!sendRes.ok) {
-          console.warn(`[${clientSlug}] IA ERRO para ${phone}. NÃO será marcado como enviado.`);
-        }
-      }
-
-      // Marca somente se sucesso real, ou se IA não está ativa
-      const shouldMark = !useIA || (sendRes && sendRes.ok === true);
-      const status = !useIA ? 'skipped' : (sendRes && sendRes.ok ? 'success' : 'error');
-
-      if (shouldMark) {
-        try { await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]); }
-        catch (err) { console.error('Erro ao deletar da fila', clientSlug, phone, err); }
-        try { await pool.query(`UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`, [phone]); }
-        catch (err) { console.error('Erro ao atualizar histórico', clientSlug, phone, err); }
-        processed++;
-      } else {
-        console.warn(`[${clientSlug}] Mantido na fila (status=${status}): ${phone}`);
-      }
-
-      try {
-        const evt = { type: 'item', name, phone, ok: shouldMark, status, at: new Date().toISOString() };
-        snapshotPush(clientSlug, evt);
-        getEmitter(clientSlug).emit('progress', evt);
-      } catch {}
-    }
-
-    await pool.query(
-      `INSERT INTO client_settings (slug, loop_status, last_run_at)
-       VALUES ($1, 'idle', NOW())
-       ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
-      [clientSlug]
-    );
-    try {
-      snapshotEnd(clientSlug, processed);
-      getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString() });
-    } catch {}
-    return { processed, status: 'ok' };
-  } catch (err) {
-    console.error('Erro no runLoopForClient', clientSlug, err);
-    return { processed: 0, status: 'error' };
-  } finally {
-    runningClients.delete(clientSlug);
-  }
-}
-
-/* ======================  CSV helpers  ====================== */
 function norm(s) {
-  return (s ?? '').toString().trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return (s ?? '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
 }
 function detectDelimiter(firstLine) {
   const commas = (firstLine.match(/,/g) || []).length;
@@ -579,12 +469,13 @@ function detectDelimiter(firstLine) {
   return semis > commas ? ';' : ',';
 }
 function parseCSV(text, delim) {
-  const rows = []; let row = [], val = '', inQuotes = false;
+  const rows = [];
+  let row = [], val = '', inQuotes = false;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '"') {
       if (inQuotes && text[i + 1] === '"') { val += '"'; i++; }
-      else inQuotes = !inQuotes;
+      else { inQuotes = !inQuotes; }
       continue;
     }
     if (ch === '\r') continue;
@@ -611,9 +502,12 @@ function mapHeader(headerCells) {
   return idx;
 }
 
-/* ======================  Endpoints  ====================== */
-app.get('/api/healthz', (_req, res) => { res.json({ up: true }); });
+/* ======================  Endpoints ====================== */
 
+/** Healthcheck */
+app.get('/api/healthz', (_req, res) => res.json({ up: true }));
+
+/** Lista clientes (slug e fila) + flags salvas */
 app.get('/api/clients', async (_req, res) => {
   try {
     const result = await pool.query(
@@ -630,18 +524,19 @@ app.get('/api/clients', async (_req, res) => {
       try {
         const [countRes, cfgRes] = await Promise.all([
           pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`),
-          pool.query(`SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at
-                        FROM client_settings WHERE slug = $1;`, [slug]),
+          pool.query(
+            `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at
+               FROM client_settings WHERE slug = $1;`,
+            [slug]
+          ),
         ]);
-        clients.push({
-          slug,
-          queueCount: Number(countRes.rows[0].count),
-          autoRun: !!cfgRes.rows[0]?.auto_run,
-          iaAuto: !!cfgRes.rows[0]?.ia_auto,
-          instanceUrl: cfgRes.rows[0]?.instance_url || null,
-          loopStatus: cfgRes.rows[0]?.loop_status || 'idle',
-          lastRunAt: cfgRes.rows[0]?.last_run_at || null,
-        });
+        const queueCount = Number(countRes.rows[0].count);
+        const autoRun = !!cfgRes.rows[0]?.auto_run;
+        const iaAuto = !!cfgRes.rows[0]?.ia_auto;
+        const instanceUrl = cfgRes.rows[0]?.instance_url || null;
+        const loopStatus = cfgRes.rows[0]?.loop_status || 'idle';
+        const lastRunAt = cfgRes.rows[0]?.last_run_at || null;
+        clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt });
       } catch (innerErr) {
         console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
@@ -654,6 +549,7 @@ app.get('/api/clients', async (_req, res) => {
   }
 });
 
+/** Cria novo cliente */
 app.post('/api/clients', async (req, res) => {
   const { slug } = req.body;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Slug inválido' });
@@ -666,6 +562,7 @@ app.post('/api/clients', async (req, res) => {
   }
 });
 
+/** KPIs (inclui info do último envio) */
 app.get('/api/stats', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
@@ -687,8 +584,11 @@ app.get('/api/stats', async (req, res) => {
       enviados = Number(r.rows[0].enviados);
 
       const r3 = await pool.query(
-        `SELECT name, phone, updated_at FROM "${totaisTable}"
-          WHERE mensagem_enviada = true ORDER BY updated_at DESC LIMIT 1;`
+        `SELECT name, phone, updated_at
+           FROM "${totaisTable}"
+          WHERE mensagem_enviada = true
+          ORDER BY updated_at DESC
+          LIMIT 1;`
       );
       if (r3.rows[0]) {
         lastSentAt = r3.rows[0].updated_at;
@@ -702,9 +602,14 @@ app.get('/api/stats', async (req, res) => {
       fila = Number(r2.rows[0].fila);
     }
 
-    return res.json({
-      totais, enviados, pendentes: totais - enviados, fila,
-      last_sent_at: lastSentAt, last_sent_name: lastSentName, last_sent_phone: lastSentPhone,
+    res.json({
+      totais,
+      enviados,
+      pendentes: totais - enviados,
+      fila,
+      last_sent_at: lastSentAt,
+      last_sent_name: lastSentName,
+      last_sent_phone: lastSentPhone,
     });
   } catch (err) {
     console.error('Erro ao obter estatísticas', err);
@@ -712,6 +617,7 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+/** Quota diária (cap, enviados hoje, restantes, janela) */
 app.get('/api/quota', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
@@ -725,21 +631,25 @@ app.get('/api/quota', async (req, res) => {
     );
     const sent_today = Number(r.rows?.[0]?.c || 0);
     const remaining = Math.max(0, cap - sent_today);
-    return res.json({
-      cap, sent_today, remaining,
+    res.json({
+      cap,
+      sent_today,
+      remaining,
       window_start: DAILY_START_TIME,
       window_end: DAILY_END_TIME,
-      now: new Date().toISOString(),
+      now: new Date().toISOString()
     });
   } catch (err) {
     console.error('Erro em /api/quota', err);
-    return res.status(500).json({ error: 'Erro interno' });
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
+/** Fila (pagina/filtra) — blindado para tabela ausente */
 app.get('/api/queue', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
+
   const exists = await tableExists(slug);
   if (!exists) return res.json({ items: [], total: 0 });
 
@@ -750,50 +660,78 @@ app.get('/api/queue', async (req, res) => {
   const values = [];
   let whereClause = '';
 
-  if (search) { values.push(`%${search}%`); whereClause = `WHERE name ILIKE $1 OR phone ILIKE $1`; }
+  if (search) {
+    values.push(`%${search}%`);
+    whereClause = `WHERE name ILIKE $1 OR phone ILIKE $1`;
+  }
 
   try {
-    const itemsRes = await pool.query(
-      `SELECT name, phone FROM "${slug}" ${whereClause}
-       ORDER BY name LIMIT $${values.length + 1} OFFSET $${values.length + 2};`,
-      [...values, pageSize, offset]
-    );
-    const countRes = await pool.query(`SELECT COUNT(*) AS total FROM "${slug}" ${whereClause};`, values);
-    res.json({ items: itemsRes.rows, total: Number(countRes.rows[0].total) });
+    const itemsSql = `
+      SELECT name, phone
+        FROM "${slug}"
+      ${whereClause}
+      ORDER BY name
+      LIMIT $${values.length + 1} OFFSET $${values.length + 2};
+    `;
+    const itemsRes = await pool.query(itemsSql, [...values, pageSize, offset]);
+    const items = itemsRes.rows;
+
+    const countSql = `SELECT COUNT(*) AS total FROM "${slug}" ${whereClause};`;
+    const countRes = await pool.query(countSql, values);
+    const total = Number(countRes.rows[0].total);
+
+    res.json({ items, total });
   } catch (err) {
     console.error('Erro ao consultar fila', err);
     res.status(500).json({ error: 'Erro interno ao consultar fila' });
   }
 });
 
+/** Remoção/Marcação manual a partir da Fila (usado pelos botões do front) */
 app.delete('/api/queue', async (req, res) => {
   try {
     const client = req.body?.client;
     const phone = req.body?.phone;
     const markSent = !!req.body?.markSent;
 
-    if (!client || !validateSlug(client) || !phone) return res.status(400).json({ error: 'Parâmetros inválidos' });
+    if (!client || !validateSlug(client) || !phone) {
+      return res.status(400).json({ error: 'Parâmetros inválidos' });
+    }
 
     await pool.query(`DELETE FROM "${client}" WHERE phone = $1;`, [phone]);
 
     let name = null;
     if (markSent) {
-      await pool.query(`UPDATE "${client}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`, [phone]);
-      const nm = await pool.query(`SELECT name FROM "${client}_totais" WHERE phone = $1 ORDER BY updated_at DESC LIMIT 1;`, [phone]);
+      await pool.query(
+        `UPDATE "${client}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
+        [phone]
+      );
+      const nm = await pool.query(
+        `SELECT name FROM "${client}_totais" WHERE phone = $1 ORDER BY updated_at DESC LIMIT 1;`,
+        [phone]
+      );
       name = nm.rows[0]?.name || null;
     }
 
-    const evt = { type: 'item', name: name || '-', phone, ok: !!markSent, status: markSent ? 'success' : 'skipped', at: new Date().toISOString() };
+    const evt = {
+      type: 'item',
+      name: name || '-',
+      phone,
+      ok: !!markSent,
+      status: markSent ? 'success' : 'skipped',
+      at: new Date().toISOString(),
+    };
     snapshotPush(client, evt);
     getEmitter(client).emit('progress', evt);
 
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (err) {
     console.error('Erro em DELETE /api/queue', err);
-    return res.status(500).json({ error: 'Erro interno' });
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
+/** Históricos (pagina/filtra) — blindado para tabela ausente */
 app.get('/api/totals', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
@@ -813,8 +751,11 @@ app.get('/api/totals', async (req, res) => {
 
   if (search) {
     params.push(`%${search}%`);
-    conditions.push(`(name ILIKE $${params.length} OR phone ILIKE $${params.length} OR niche ILIKE $${params.length})`);
+    conditions.push(
+      `(name ILIKE $${params.length} OR phone ILIKE $${params.length} OR niche ILIKE $${params.length})`
+    );
   }
+
   if (sent !== 'all') {
     if (sent === 'sim') conditions.push('mensagem_enviada = true');
     else if (sent === 'nao') conditions.push('mensagem_enviada = false');
@@ -823,28 +764,38 @@ app.get('/api/totals', async (req, res) => {
   const whereClause = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
   try {
-    const itemsRes = await pool.query(
-      `SELECT name, phone, niche, mensagem_enviada, updated_at
-         FROM "${totaisTable}" ${whereClause}
-         ORDER BY updated_at DESC
-         LIMIT $${params.length + 1} OFFSET $${params.length + 2};`,
-      [...params, pageSize, offset]
-    );
-    const countRes = await pool.query(`SELECT COUNT(*) AS total FROM "${totaisTable}" ${whereClause};`, params);
-    res.json({ items: itemsRes.rows, total: Number(countRes.rows[0].total) });
+    const itemsSql = `
+      SELECT name, phone, niche, mensagem_enviada, updated_at
+        FROM "${totaisTable}"
+      ${whereClause}
+      ORDER BY updated_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2};
+    `;
+    const itemsRes = await pool.query(itemsSql, [...params, pageSize, offset]);
+    const items = itemsRes.rows;
+
+    const countSql = `SELECT COUNT(*) AS total FROM "${totaisTable}" ${whereClause};`;
+    const countRes = await pool.query(countSql, params);
+    const total = Number(countRes.rows[0].total);
+
+    res.json({ items, total });
   } catch (err) {
     console.error('Erro ao consultar totais', err);
     res.status(500).json({ error: 'Erro interno ao consultar totais' });
   }
 });
 
+/** Adiciona um contato individual */
 app.post('/api/contacts', async (req, res) => {
   const { client, name, phone, niche } = req.body;
   if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
   if (!name || !phone) return res.status(400).json({ error: 'Nome e telefone são obrigatórios' });
 
   try {
-    const result = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [client, name, phone, niche || null]);
+    const result = await pool.query(
+      'SELECT client_add_contact($1, $2, $3, $4) AS status;',
+      [client, name, phone, niche || null]
+    );
     const status = result.rows[0]?.status || 'inserted';
     res.json({ status });
   } catch (err) {
@@ -854,6 +805,7 @@ app.post('/api/contacts', async (req, res) => {
   }
 });
 
+/** Importa CSV (arquivo + slug) */
 app.post('/api/import', upload.single('file'), async (req, res) => {
   try {
     const slug = req.body?.client;
@@ -864,6 +816,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     const firstLine = text.split(/\r?\n/)[0] || '';
     const delim = detectDelimiter(firstLine);
     const rows = parseCSV(text, delim);
+
     if (!rows.length) return res.json({ inserted: 0, skipped: 0, errors: 0 });
 
     const header = rows[0] || [];
@@ -873,8 +826,11 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     }
 
     let inserted = 0, skipped = 0, errors = 0;
+
     for (let i = 1; i < rows.length; i++) {
-      const r = rows[i]; if (!r || !r.length) continue;
+      const r = rows[i];
+      if (!r || !r.length) continue;
+
       const name = (r[idx.name] || '').toString().trim();
       const phone = (r[idx.phone] || '').toString().trim();
       const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
@@ -882,7 +838,9 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       if (!name || !phone) { skipped++; continue; }
 
       try {
-        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, name, phone, niche]);
+        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [
+          slug, name, phone, niche,
+        ]);
         const status = q.rows[0]?.status || 'inserted';
         if (status === 'inserted') inserted++; else skipped++;
       } catch (e) {
@@ -890,6 +848,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
         errors++;
       }
     }
+
     res.json({ inserted, skipped, errors });
   } catch (err) {
     console.error('Erro no import CSV', err);
@@ -901,6 +860,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
 app.get('/api/client-settings', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
+
   try {
     const cfg = await getClientSettings(slug);
     res.json({
@@ -921,14 +881,32 @@ app.get('/api/client-settings', async (req, res) => {
 
 /** Salva configurações do cliente (inclui token/header/scheme) */
 app.post('/api/client-settings', async (req, res) => {
-  const { client, autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme } = req.body || {};
+  const {
+    client,
+    autoRun,
+    iaAuto,
+    instanceUrl,
+    instanceToken,
+    instanceAuthHeader,
+    instanceAuthScheme,
+  } = req.body || {};
   if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
+
   try {
     if (instanceUrl) {
       try { new URL(instanceUrl); }
       catch { return res.status(400).json({ error: 'instanceUrl inválida' }); }
     }
-    await saveClientSettings(client, { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme });
+
+    await saveClientSettings(client, {
+      autoRun,
+      iaAuto,
+      instanceUrl,
+      instanceToken,
+      instanceAuthHeader,
+      instanceAuthScheme,
+    });
+
     const cfg = await getClientSettings(client);
     res.json({ ok: true, settings: cfg });
   } catch (err) {
@@ -943,7 +921,9 @@ app.delete('/api/delete-client', async (req, res) => {
     const client = req.body?.client || req.query?.client;
     if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
 
-    if (runningClients.has(client)) return res.status(409).json({ error: 'Loop em execução para este cliente. Tente novamente em instantes.' });
+    if (runningClients.has(client)) {
+      return res.status(409).json({ error: 'Loop em execução para este cliente. Tente novamente em instantes.' });
+    }
 
     await pool.query('BEGIN');
     await pool.query(`DROP TABLE IF EXISTS "${client}" CASCADE;`);
@@ -952,29 +932,33 @@ app.delete('/api/delete-client', async (req, res) => {
     await pool.query('COMMIT');
 
     runningClients.delete(client);
-    return res.json({ status: 'ok', deleted: client });
+    res.json({ status: 'ok', deleted: client });
   } catch (err) {
     console.error('Erro ao apagar cliente', err);
     try { await pool.query('ROLLBACK'); } catch {}
-    return res.status(500).json({ error: 'Erro interno ao apagar cliente' });
+    res.status(500).json({ error: 'Erro interno ao apagar cliente' });
   }
 });
 
-/** Loop manual */
+/**
+ * Endpoint para iniciar manualmente o loop de processamento de um cliente.
+ * Espera body JSON: { client: 'cliente_x', iaAuto?: boolean }
+ */
 app.post('/api/loop', async (req, res) => {
   const clientSlug = req.body?.client;
   const iaAutoOverride = req.body?.iaAuto;
   if (!clientSlug || !validateSlug(clientSlug)) return res.status(400).json({ error: 'Cliente inválido' });
+
   try {
     const result = await runLoopForClient(clientSlug, { iaAutoOverride });
-    return res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
+    res.json({ message: 'Loop executado', processed: result.processed, status: result.status || 'ok' });
   } catch (err) {
     console.error('Erro ao executar loop manual', err);
-    return res.status(500).json({ error: 'Erro interno ao executar loop' });
+    res.status(500).json({ error: 'Erro interno ao executar loop' });
   }
 });
 
-/** SSE de progresso */
+/** SSE de progresso por cliente (com replay do último estado) */
 app.get('/api/progress', (req, res) => {
   try {
     const client = req.query?.client;
@@ -992,26 +976,231 @@ app.get('/api/progress', (req, res) => {
       if (st?.lastStart) res.write(`data: ${JSON.stringify(st.lastStart)}\n\n`);
       if (st?.items?.length) for (const it of st.items) res.write(`data: ${JSON.stringify(it)}\n\n`);
       if (st?.lastEnd) res.write(`data: ${JSON.stringify(st.lastEnd)}\n\n`);
-    } catch (e) {}
+    } catch {}
 
     const em = getEmitter(client);
-    const onProgress = (payload) => { try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch {} };
+    const onProgress = (payload) => {
+      try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch {}
+    };
     em.on('progress', onProgress);
 
-    const ka = setInterval(() => { try { res.write(`event: ping\ndata: {}\n\n`); } catch {} }, 15000);
+    const ka = setInterval(() => {
+      try { res.write(`event: ping\ndata: {}\n\n`); } catch {}
+    }, 15000);
 
     req.on('close', () => {
       em.off('progress', onProgress);
       clearInterval(ka);
       try { res.end(); } catch {}
     });
-  } catch (err) { try { res.end(); } catch {} }
+  } catch {
+    try { res.end(); } catch {}
+  }
 });
 
-/** Catch-all: responde 404 JSON (evita tentar servir index inexistente) */
-app.get('*', (_req, res) => { res.status(404).json({ error: 'Not found' }); });
+/* ======================  Loop de processamento por cliente  ====================== */
+async function runLoopForClient(clientSlug, opts = {}) {
+  if (!validateSlug(clientSlug)) throw new Error('Slug inválido');
+  if (runningClients.has(clientSlug)) return { processed: 0, status: 'already_running' };
 
-/* =====================  Scheduler diário  ===================== */
+  runningClients.add(clientSlug);
+  const batchSize = parseInt(process.env.LOOP_BATCH_SIZE, 10) || opts.batchSize || DAILY_MESSAGE_COUNT;
+
+  try {
+    await pool.query(
+      `INSERT INTO client_settings (slug, loop_status, last_run_at)
+       VALUES ($1, 'running', NOW())
+       ON CONFLICT (slug) DO UPDATE SET loop_status = 'running', last_run_at = NOW()`,
+      [clientSlug]
+    );
+
+    const exists = await tableExists(clientSlug);
+    if (!exists) {
+      await pool.query(
+        `INSERT INTO client_settings (slug, loop_status, last_run_at)
+         VALUES ($1, 'idle', NOW())
+         ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
+        [clientSlug]
+      );
+      return { processed: 0, status: 'ok' };
+    }
+
+    // total na fila
+    let totalCount = 0;
+    try {
+      const _cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${clientSlug}";`);
+      totalCount = Number(_cnt.rows?.[0]?.count || 0);
+    } catch {}
+
+    // Snapshot de início para SSE
+    try {
+      snapshotStart(clientSlug, totalCount);
+      getEmitter(clientSlug).emit('progress', { type: 'start', total: totalCount, at: new Date().toISOString() });
+    } catch {}
+
+    const settings = await getClientSettings(clientSlug);
+    let processed = 0;
+    const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
+
+    // Cota diária: contar enviados hoje
+    let alreadySentToday = 0;
+    try {
+      const sentTodayRes = await pool.query(
+        `SELECT COUNT(*)::int AS c
+           FROM "${clientSlug}_totais"
+          WHERE mensagem_enviada = true
+            AND updated_at::date = CURRENT_DATE;`
+      );
+      alreadySentToday = Number(sentTodayRes.rows?.[0]?.c || 0);
+      console.log(`[${clientSlug}] Enviadas hoje: ${alreadySentToday}/${DAILY_MESSAGE_COUNT}`);
+    } catch (e) {
+      console.warn(`[${clientSlug}] Falha ao contar envios de hoje`, e);
+    }
+
+    const remainingToday = Math.max(0, DAILY_MESSAGE_COUNT - alreadySentToday);
+    if (remainingToday <= 0) {
+      console.log(`[${clientSlug}] Cota diária (${DAILY_MESSAGE_COUNT}) atingida. Encerrando.`);
+      try {
+        snapshotEnd(clientSlug, processed, { reason: 'daily_quota' });
+        getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString(), reason: 'daily_quota' });
+      } catch {}
+      await pool.query(`UPDATE client_settings SET loop_status='idle', last_run_at=NOW() WHERE slug=$1;`, [clientSlug]);
+      return { processed, status: 'quota_reached' };
+    }
+
+    // Gera grade de delays
+    const scheduleDelays = generateScheduleDelays(DAILY_MESSAGE_COUNT, DAILY_START_TIME, DAILY_END_TIME);
+    const messageLimit = Math.min(batchSize, scheduleDelays.length);
+
+    // Anuncia grade planejada
+    const planCount = Math.min(messageLimit, remainingToday);
+    try {
+      let acc = 0;
+      const planned = [];
+      for (let i = 0; i < planCount; i++) {
+        acc += scheduleDelays[i];
+        planned.push(new Date(Date.now() + acc * 1000).toISOString());
+      }
+      getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
+    } catch {}
+
+    const attemptedPhones = new Set();
+
+    for (let i = 0; i < messageLimit; i++) {
+      if (i >= remainingToday) {
+        console.log(`[${clientSlug}] Cota diária atingida durante o ciclo. Encerrando.`);
+        break;
+      }
+
+      const delaySec = scheduleDelays[i];
+      if (delaySec > 0) {
+        const when = new Date(Date.now() + delaySec * 1000);
+        console.log(
+          `[${clientSlug}] Aguardando ${delaySec}s (${when.toTimeString().split(' ')[0]}) para enviar a mensagem ${i + 1}/${messageLimit}.`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
+      }
+
+      // Seleciona próximo contato, ignorando os já tentados nesse ciclo
+      let whereNotIn = '';
+      let params = [];
+      if (attemptedPhones.size) {
+        const arr = Array.from(attemptedPhones);
+        const ph = arr.map((_, idx) => `$${idx + 1}`).join(',');
+        whereNotIn = `WHERE phone NOT IN (${ph})`;
+        params = arr;
+      }
+
+      const next = await pool.query(
+        `SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`,
+        params
+      );
+      if (next.rows.length === 0) break;
+
+      const { name, phone } = next.rows[0];
+      attemptedPhones.add(phone);
+
+      let sendRes = null;
+      if (useIA) {
+        sendRes = await runIAForContact({
+          client: clientSlug,
+          name,
+          phone,
+          instanceUrl: settings.instance_url,
+          instanceToken: settings.instance_token,
+          instanceAuthHeader: settings.instance_auth_header,
+          instanceAuthScheme: settings.instance_auth_scheme,
+        });
+        if (!sendRes.ok) {
+          console.warn(`[${clientSlug}] IA retornou erro para ${phone}. NÃO será marcado como enviado.`);
+        }
+      }
+
+      // Apenas marca como enviado quando houver sucesso real
+      let status = 'skipped';
+      if (useIA) status = sendRes && sendRes.ok ? 'success' : 'error';
+      const shouldMark = status === 'success';
+
+      if (shouldMark) {
+        try {
+          await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
+        } catch (err) {
+          console.error('Erro ao deletar da fila', clientSlug, phone, err);
+        }
+        try {
+          await pool.query(
+            `UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`,
+            [phone]
+          );
+        } catch (err) {
+          console.error('Erro ao atualizar histórico', clientSlug, phone, err);
+        }
+      } else {
+        console.warn(`[${clientSlug}] NÃO marcou como enviada (${status}). Mantendo na fila: ${phone}`);
+      }
+
+      if (shouldMark) processed++;
+
+      try {
+        const evt = {
+          type: 'item',
+          name,
+          phone,
+          ok: shouldMark,
+          status,
+          at: new Date().toISOString(),
+        };
+        snapshotPush(clientSlug, evt);
+        getEmitter(clientSlug).emit('progress', evt);
+      } catch {}
+    }
+
+    // Ao final, atualiza status
+    await pool.query(
+      `INSERT INTO client_settings (slug, loop_status, last_run_at)
+       VALUES ($1, 'idle', NOW())
+       ON CONFLICT (slug) DO UPDATE SET loop_status = 'idle', last_run_at = NOW()`,
+      [clientSlug]
+    );
+
+    try {
+      snapshotEnd(clientSlug, processed);
+      getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString() });
+    } catch {}
+
+    return { processed, status: 'ok' };
+  } catch (err) {
+    console.error('Erro no runLoopForClient', clientSlug, err);
+    return { processed: 0, status: 'error' };
+  } finally {
+    runningClients.delete(clientSlug);
+  }
+}
+
+/* =====================  Scheduler: Auto-run diário  ===================== */
+/**
+ * Executa às 08:00 para todos os clientes com auto_run = true e fila > 0.
+ */
 function scheduleDailyAutoRun() {
   const now = new Date();
   const nextRun = new Date(now);
@@ -1029,15 +1218,28 @@ function scheduleDailyAutoRun() {
           if (!exists) continue;
           const cnt = await pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`);
           const queueCount = Number(cnt.rows[0].count);
-          if (queueCount > 0) runLoopForClient(slug).catch((e) => console.error('Auto-run erro', slug, e));
-        } catch (err) { console.error('Erro no auto-run para', slug, err); }
+          if (queueCount > 0) {
+            runLoopForClient(slug).catch((e) => console.error('Auto-run erro', slug, e));
+          }
+        } catch (err) {
+          console.error('Erro ao executar loop automático para', slug, err);
+        }
       }
-    } catch (err) { console.error('Erro no scheduler de loop automático', err); }
-    finally { scheduleDailyAutoRun(); }
+    } catch (err) {
+      console.error('Erro no scheduler de loop automático', err);
+    } finally {
+      scheduleDailyAutoRun();
+    }
   }, msUntilNext);
 }
 scheduleDailyAutoRun();
 
+/* =====================  Catch-all  ===================== */
+// Retorna 404 JSON (evita tentar servir index.html inexistente)
+app.get('*', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
 /* =====================  Boot  ===================== */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`Servidor rodando na porta ${PORT}`); });
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
