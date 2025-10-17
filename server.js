@@ -258,7 +258,7 @@ async function saveClientSettings(
 
 /* ======================  IA (UAZAPI URL-ONLY FLEX) ====================== */
 
-// [CHANGE] Corrigido para retornar **string** em E.164 com '+'
+// Corrigido para retornar **string** em E.164 com '+'
 function normalizePhoneE164BR(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -343,47 +343,79 @@ async function httpSend({ url, method, headers, body }) {
   });
 }
 
+/**
+ * >>>>>>>>>>  ALTERADO AQUI  <<<<<<<<<<
+ * - Se usar GET: envia phone/text na query (template ou query).
+ * - Se usar POST: envia phone/text no **corpo JSON** (e limpa a query da URL),
+ *   evitando o erro "Missing required fields".
+ */
 function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
-  const hasQueryNumber = /\?[^]*=/.test(instanceUrl); // [ADD] detecção mais ampla
+  const hasQueryParams = /\?[^#]*=/.test(instanceUrl); // existe algo tipo ?a=b
   const style = UAZ.payloadStyle;
   const methodEnv = UAZ.methodPref;
-  const methodAuto =
-    methodEnv === 'get' ||
-    (methodEnv === 'auto' && (hasTpl || hasQueryNumber))
-      ? 'GET'
-      : 'POST';
 
-  if (style === 'template' || hasTpl) {
-    let url = instanceUrl
-      .replace(/\{NUMBER\}/g, digits)
-      .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
-      .replace(/\{TEXT\}/g, encodeURIComponent(text));
-    const method = methodEnv === 'post' ? 'POST' : 'GET';
-    const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : {};
-    return { url, method, headers, body: method === 'POST' ? JSON.stringify({}) : undefined };
-  }
+  // método escolhido: GET se auto+template/query, senão POST
+  const wantsGet =
+    methodEnv === 'get' || (methodEnv === 'auto' && (hasTpl || hasQueryParams));
+  const phoneValue = UAZ.digitsOnly ? digits : e164;
 
-  if (style === 'query' || hasQueryNumber) {
-    const u = new URL(instanceUrl);
-    u.searchParams.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
-    u.searchParams.set(UAZ.textField, text);
-    Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
-      if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
-    });
-    const method = methodEnv === 'post' ? 'POST' : 'GET';
-    const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : {};
+  // monta JSON padronizado
+  const makeJson = () => {
+    const payload = { ...UAZ.extra };
+    payload[UAZ.phoneField] = phoneValue;
+    payload[UAZ.textField] = text;
     return {
-      url: u.toString(),
-      method,
-      headers,
-      body: method === 'POST' ? JSON.stringify({}) : undefined,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     };
+  };
+
+  // 1) URL com placeholders {NUMBER}/{PHONE_E164}/{TEXT}
+  if (style === 'template' || hasTpl) {
+    if (wantsGet) {
+      const url = instanceUrl
+        .replace(/\{NUMBER\}/g, digits)
+        .replace(/\{PHONE_E164\}/g, encodeURIComponent(e164))
+        .replace(/\{TEXT\}/g, encodeURIComponent(text));
+      return { url, method: 'GET', headers: {}, body: undefined };
+    }
+    // POST: manda JSON no corpo e limpa a query/path templateda
+    let cleanUrl;
+    try {
+      const u = new URL(instanceUrl);
+      cleanUrl = u.origin + u.pathname;
+    } catch {
+      cleanUrl = instanceUrl.split('?')[0];
+    }
+    const j = makeJson();
+    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
   }
 
+  // 2) URL já com query (?phone=...&text=...)
+  if (style === 'query' || hasQueryParams) {
+    const u = new URL(instanceUrl);
+
+    if (wantsGet) {
+      // garante params na query
+      u.searchParams.set(UAZ.phoneField, phoneValue);
+      u.searchParams.set(UAZ.textField, text);
+      Object.entries(UAZ.extra || {}).forEach(([k, v]) => {
+        if (['string', 'number', 'boolean'].includes(typeof v)) u.searchParams.set(k, String(v));
+      });
+      return { url: u.toString(), method: 'GET', headers: {}, body: undefined };
+    }
+
+    // POST: muitos gateways ignoram params de query com POST → envia JSON no corpo
+    const cleanUrl = u.origin + u.pathname;
+    const j = makeJson();
+    return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
+  }
+
+  // 3) FORM (x-www-form-urlencoded)
   if (style === 'form') {
     const form = new URLSearchParams();
-    form.set(UAZ.phoneField, UAZ.digitsOnly ? digits : e164);
+    form.set(UAZ.phoneField, phoneValue);
     form.set(UAZ.textField, text);
     Object.entries(UAZ.extra || {}).forEach(([k, v]) =>
       form.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v))
@@ -392,8 +424,9 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
   }
 
+  // 4) JSON (default quando não há template/query)
   const payload = { ...UAZ.extra };
-  payload[UAZ.phoneField] = UAZ.digitsOnly ? digits : e164;
+  payload[UAZ.phoneField] = phoneValue;
   payload[UAZ.textField] = text;
   const headers = { 'Content-Type': 'application/json' };
   return { url: instanceUrl, method: 'POST', headers, body: JSON.stringify(payload) };
@@ -411,7 +444,7 @@ async function runIAForContact({
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
   try {
-    const e164 = normalizePhoneE164BR(phone);       // [CHANGE] agora é "+55..."
+    const e164 = normalizePhoneE164BR(phone);
     const digits = String(e164).replace(/\D/g, '');
     const text = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
 
@@ -512,7 +545,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
     let processed = 0;
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
 
-    // [ADD] Cota diária: conta enviados hoje e calcula o restante do dia (cap = 30)
+    // Cota diária
     let alreadySentToday = 0;
     try {
       const sentTodayRes = await pool.query(
@@ -554,7 +587,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
     );
     const messageLimit = Math.min(batchSize, scheduleDelays.length);
 
-    // [ADD] Anuncia via SSE a grade planejada para hoje (limitada pela cota restante)
+    // Agenda planejada (SSE)
     const planCount = Math.min(messageLimit, remainingToday);
     try {
       let acc = 0;
@@ -571,11 +604,10 @@ async function runLoopForClient(clientSlug, opts = {}) {
       });
     } catch {}
 
-    // [ADD] Evitar re-tentar o mesmo telefone no mesmo ciclo se falhar/skipped
+    // Evita re-tentar mesmo telefone no ciclo
     const attemptedPhones = new Set();
 
     for (let i = 0; i < messageLimit; i++) {
-      // [ADD] Proteção adicional: corta se atingir a cota restante no meio do ciclo
       if (i >= remainingToday) {
         console.log(`[${clientSlug}] Cota diária atingida durante o ciclo. Encerrando.`);
         break;
@@ -590,7 +622,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
         await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
       }
 
-      // [ADD] Seleciona ignorando os que já tentamos neste ciclo (evita loop no mesmo contato)
+      // Pega próximo ignorando os já tentados
       let whereNotIn = '';
       let params = [];
       if (attemptedPhones.size) {
@@ -603,10 +635,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
         `SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`,
         params
       );
-
-      if (next.rows.length === 0) {
-        break;
-      }
+      if (next.rows.length === 0) break;
 
       const { name, phone } = next.rows[0];
       attemptedPhones.add(phone);
@@ -629,12 +658,11 @@ async function runLoopForClient(clientSlug, opts = {}) {
         }
       }
 
-      // [ADD] Determina status e se deve marcar
+      // Status final e marcação
       let status = 'skipped';
       if (useIA) status = sendRes && sendRes.ok ? 'success' : 'error';
       const shouldMark = status === 'success';
 
-      // [ADD] Retira da fila e marca enviados **apenas** em caso de sucesso real
       if (shouldMark) {
         try {
           await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
@@ -650,12 +678,11 @@ async function runLoopForClient(clientSlug, opts = {}) {
           console.error('Erro ao atualizar histórico', clientSlug, phone, err);
         }
       } else {
-        // Mantém na fila para tentar depois
         console.warn(`[${clientSlug}] NÃO marcou como enviada (${status}). Mantendo na fila: ${phone}`);
       }
 
       processed++;
-      if (!shouldMark) processed--; // [ADD] conta apenas sucessos
+      if (!shouldMark) processed--;
 
       try {
         const evt = {
@@ -663,7 +690,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
           name,
           phone,
           ok: shouldMark,
-          status,                 // [ADD] status coerente: success | error | skipped
+          status,
           at: new Date().toISOString(),
         };
         snapshotPush(clientSlug, evt);
@@ -1020,7 +1047,7 @@ app.delete('/api/queue', async (req, res) => {
       name = nm.rows[0]?.name || null;
     }
 
-    // Dispara um evento de progresso "simulado" para refletir ação manual
+    // evento SSE simulando ação manual
     const evt = {
       type: 'item',
       name: name || '-',
@@ -1093,189 +1120,6 @@ app.get('/api/totals', async (req, res) => {
   } catch (err) {
     console.error('Erro ao consultar totais', err);
     res.status(500).json({ error: 'Erro interno ao consultar totais' });
-  }
-});
-
-/** Adiciona um contato individual */
-app.post('/api/contacts', async (req, res) => {
-  const { client, name, phone, niche } = req.body;
-  if (!client || !validateSlug(client)) {
-    return res.status(400).json({ error: 'Cliente inválido' });
-  }
-  if (!name || !phone) {
-    return res.status(400).json({ error: 'Nome e telefone são obrigatórios' });
-  }
-  try {
-    const result = await pool.query(
-      'SELECT client_add_contact($1, $2, $3, $4) AS status;',
-      [client, name, phone, niche || null]
-    );
-    const status = result.rows[0]?.status || 'inserted';
-    res.json({ status });
-  } catch (err) {
-    if (err.code === '23505') return res.json({ status: 'skipped_conflict' });
-    console.error('Erro ao adicionar contato', err);
-    res.status(500).json({ error: 'Erro interno ao adicionar contato' });
-  }
-});
-
-/** Importa CSV (arquivo + slug) */
-app.post('/api/import', upload.single('file'), async (req, res) => {
-  try {
-    const slug = req.body?.client;
-    if (!slug || !validateSlug(slug)) {
-      return res.status(400).json({ error: 'Cliente inválido' });
-    }
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ error: 'Arquivo não enviado' });
-    }
-
-    const text = req.file.buffer.toString('utf8');
-    const firstLine = text.split(/\r?\n/)[0] || '';
-    const delim = detectDelimiter(firstLine);
-    const rows = parseCSV(text, delim);
-
-    if (!rows.length) return res.json({ inserted: 0, skipped: 0, errors: 0 });
-
-    const header = rows[0] || [];
-    const idx = mapHeader(header);
-    if (idx.name === -1 || idx.phone === -1) {
-      return res.status(400).json({ error: 'Cabeçalho inválido. Precisa conter colunas de nome e telefone.' });
-    }
-
-    let inserted = 0,
-      skipped = 0,
-      errors = 0;
-
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i];
-      if (!r || !r.length) continue;
-
-      const name = (r[idx.name] || '').toString().trim();
-      const phone = (r[idx.phone] || '').toString().trim();
-      const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
-
-      if (!name || !phone) {
-        skipped++;
-        continue;
-      }
-
-      try {
-        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [
-          slug,
-          name,
-          phone,
-          niche,
-        ]);
-        const status = q.rows[0]?.status || 'inserted';
-        if (status === 'inserted') inserted++;
-        else skipped++;
-      } catch (e) {
-        console.error('Erro linha CSV', i, e);
-        errors++;
-      }
-    }
-
-    res.json({ inserted, skipped, errors });
-  } catch (err) {
-    console.error('Erro no import CSV', err);
-    res.status(500).json({ error: 'Erro interno ao importar CSV' });
-  }
-});
-
-/** Lê configurações do cliente (inclui token/header/scheme) */
-app.get('/api/client-settings', async (req, res) => {
-  const slug = req.query.client;
-  if (!slug || !validateSlug(slug)) {
-    return res.status(400).json({ error: 'Cliente inválido' });
-  }
-  try {
-    const cfg = await getClientSettings(slug);
-    res.json({
-      autoRun: !!cfg.auto_run,
-      iaAuto: !!cfg.ia_auto,
-      instanceUrl: cfg.instance_url || null,
-      instanceToken: cfg.instance_token || '',
-      instanceAuthHeader: cfg.instance_auth_header || 'token',
-      instanceAuthScheme: cfg.instance_auth_scheme || '',
-      loopStatus: cfg.loop_status || 'idle',
-      lastRunAt: cfg.last_run_at || null,
-    });
-  } catch (err) {
-    console.error('Erro ao obter configurações', err);
-    res.status(500).json({ error: 'Erro interno' });
-  }
-});
-
-/** Salva configurações do cliente (inclui token/header/scheme) */
-app.post('/api/client-settings', async (req, res) => {
-  const {
-    client,
-    autoRun,
-    iaAuto,
-    instanceUrl,
-    instanceToken,
-    instanceAuthHeader,
-    instanceAuthScheme,
-  } = req.body || {};
-  if (!client || !validateSlug(client)) {
-    return res.status(400).json({ error: 'Cliente inválido' });
-  }
-  try {
-    if (instanceUrl) {
-      try {
-        new URL(instanceUrl);
-      } catch {
-        return res.status(400).json({ error: 'instanceUrl inválida' });
-      }
-    }
-
-    await saveClientSettings(client, {
-      autoRun,
-      iaAuto,
-      instanceUrl,
-      instanceToken,
-      instanceAuthHeader,
-      instanceAuthScheme,
-    });
-
-    const cfg = await getClientSettings(client);
-    res.json({ ok: true, settings: cfg });
-  } catch (err) {
-    console.error('Erro ao salvar configurações', err);
-    res.status(500).json({ error: 'Erro interno ao salvar configurações' });
-  }
-});
-
-/** Apaga completamente as tabelas e as configurações de um cliente */
-app.delete('/api/delete-client', async (req, res) => {
-  try {
-    const client = req.body?.client || req.query?.client;
-    if (!client || !validateSlug(client)) {
-      return res.status(400).json({ error: 'Cliente inválido' });
-    }
-
-    // Bloqueia se o loop deste cliente estiver rodando
-    if (runningClients.has(client)) {
-      return res.status(409).json({ error: 'Loop em execução para este cliente. Tente novamente em instantes.' });
-    }
-
-    await pool.query('BEGIN');
-    await pool.query(`DROP TABLE IF EXISTS "${client}" CASCADE;`);
-    await pool.query(`DROP TABLE IF EXISTS "${client}_totais" CASCADE;`);
-    await pool.query(`DELETE FROM client_settings WHERE slug = $1;`, [client]);
-    await pool.query('COMMIT');
-
-    // Garantia: remover eventual trava residual
-    runningClients.delete(client);
-
-    return res.json({ status: 'ok', deleted: client });
-  } catch (err) {
-    console.error('Erro ao apagar cliente', err);
-    try {
-      await pool.query('ROLLBACK');
-    } catch {}
-    return res.status(500).json({ error: 'Erro interno ao apagar cliente' });
   }
 });
 
