@@ -115,6 +115,8 @@ const COMPAT_ENDPOINTS = new Set([
   'delete-client',
   'healthz',
   'quota',
+  /* >>> ADIÇÃO */
+  'leads',
 ]);
 
 app.use((req, _res, next) => {
@@ -500,6 +502,20 @@ function mapHeader(headerCells) {
     if (idx.niche === -1 && nicheKeys.has(h)) idx.niche = i;
   });
   return idx;
+}
+
+/* ======================  ADIÇÃO: integração com buscador de leads  ====================== */
+/* Arquivo novo separado (leadsSearcher.js) encapsula a chamada ao serviço Smart-Leads */
+const { searchLeads } = require('./leadsSearcher');
+
+/** Garante que as tabelas do cliente tenham a coluna region (adição não destrutiva) */
+async function ensureRegionColumns(slug) {
+  try {
+    await pool.query(`ALTER TABLE "${slug}" ADD COLUMN IF NOT EXISTS region TEXT;`);
+  } catch (e) { console.warn('ensureRegionColumns fila', slug, e?.message); }
+  try {
+    await pool.query(`ALTER TABLE "${slug}_totais" ADD COLUMN IF NOT EXISTS region TEXT;`);
+  } catch (e) { console.warn('ensureRegionColumns totais', slug, e?.message); }
 }
 
 /* ======================  Endpoints ====================== */
@@ -974,6 +990,55 @@ app.post('/api/stop-loop', async (req, res) => {
 
   console.log(`[STOP] Parada solicitada para ${client}`);
   return res.json({ ok: true, message: `Parada solicitada para ${client}` });
+});
+
+/* ======================  >>> ADIÇÃO: Buscar & salvar LEADS  ====================== */
+/**
+ * POST /api/leads
+ * Body: { client: 'cliente_x', region?: string, niche?: string, limit?: number }
+ * Integra com o Back-Smart-Leads e salva na base do cliente (evita duplicados).
+ */
+app.post('/api/leads', async (req, res) => {
+  try {
+    const { client, region, niche, limit } = req.body || {};
+    if (!client || !validateSlug(client)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
+    }
+
+    await ensureRegionColumns(client);
+
+    // Chama a busca (arquivo leadsSearcher.js)
+    const raw = await searchLeads({ region, niche, limit });
+    const results = Array.isArray(raw) ? raw : [];
+
+    let inserted = 0, skipped = 0, errors = 0;
+
+    for (const item of results) {
+      const name   = (item.name && String(item.name).trim()) || String(item.phone || '').trim();
+      const phone  = String(item.phone || '').trim();
+      const reg    = (item.region ?? region) || null;
+      const nich   = (item.niche  ?? niche ) || null;
+
+      if (!phone) { skipped++; continue; }
+
+      try {
+        // Nova função no Postgres (vide seção SQL) — não altera a função existente
+        const r = await pool.query(`SELECT client_add_lead($1,$2,$3,$4,$5) AS status;`,
+          [client, name, phone, reg, nich]);
+        const status = r.rows?.[0]?.status || 'inserted';
+        if (status === 'inserted' || status === 'queued_existing') inserted++;
+        else skipped++;
+      } catch (e) {
+        console.error('Erro ao inserir lead', client, phone, e);
+        errors++;
+      }
+    }
+
+    res.json({ found: results.length, inserted, skipped, errors });
+  } catch (err) {
+    console.error('Erro em /api/leads', err);
+    res.status(500).json({ error: 'Erro interno na busca de leads' });
+  }
 });
 
 /**
