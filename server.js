@@ -940,6 +940,42 @@ app.delete('/api/delete-client', async (req, res) => {
   }
 });
 
+/* ======================  >>> ADIÇÃO: Parada manual do loop  ====================== */
+// conjunto de pedidos de parada (por cliente)
+const stopRequests = new Set();
+
+// sleep abortável que verifica sinal de parada a cada 250ms
+async function sleepAbortable(ms, slug) {
+  const step = 250;
+  let elapsed = 0;
+  while (elapsed < ms) {
+    if (stopRequests.has(slug)) return 'aborted';
+    const toWait = Math.min(step, ms - elapsed);
+    await new Promise((r) => setTimeout(r, toWait));
+    elapsed += toWait;
+  }
+  return 'ok';
+}
+
+/** Solicita parada imediata do loop do cliente */
+app.post('/api/stop-loop', async (req, res) => {
+  const client = req.body?.client;
+  if (!client || !validateSlug(client)) {
+    return res.status(400).json({ ok: false, message: 'Cliente inválido' });
+  }
+  if (!runningClients.has(client)) {
+    return res.status(404).json({ ok: false, message: `Nenhum loop ativo para ${client}` });
+  }
+
+  stopRequests.add(client);
+  try {
+    await pool.query(`UPDATE client_settings SET loop_status='stopping', last_run_at=NOW() WHERE slug=$1`, [client]);
+  } catch {}
+
+  console.log(`[STOP] Parada solicitada para ${client}`);
+  return res.json({ ok: true, message: `Parada solicitada para ${client}` });
+});
+
 /**
  * Endpoint para iniciar manualmente o loop de processamento de um cliente.
  * Espera body JSON: { client: 'cliente_x', iaAuto?: boolean }
@@ -1040,6 +1076,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
     const settings = await getClientSettings(clientSlug);
     let processed = 0;
+    let manualStop = false;
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
 
     // Cota diária: contar enviados hoje
@@ -1057,8 +1094,13 @@ async function runLoopForClient(clientSlug, opts = {}) {
       console.warn(`[${clientSlug}] Falha ao contar envios de hoje`, e);
     }
 
+    // Se já pediram parada antes de começar, respeita
+    if (stopRequests.has(clientSlug)) {
+      manualStop = true;
+    }
+
     const remainingToday = Math.max(0, DAILY_MESSAGE_COUNT - alreadySentToday);
-    if (remainingToday <= 0) {
+    if (!manualStop && remainingToday <= 0) {
       console.log(`[${clientSlug}] Cota diária (${DAILY_MESSAGE_COUNT}) atingida. Encerrando.`);
       try {
         snapshotEnd(clientSlug, processed, { reason: 'daily_quota' });
@@ -1074,19 +1116,22 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
     // Anuncia grade planejada
     const planCount = Math.min(messageLimit, remainingToday);
-    try {
-      let acc = 0;
-      const planned = [];
-      for (let i = 0; i < planCount; i++) {
-        acc += scheduleDelays[i];
-        planned.push(new Date(Date.now() + acc * 1000).toISOString());
-      }
-      getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
-    } catch {}
+    if (!manualStop) {
+      try {
+        let acc = 0;
+        const planned = [];
+        for (let i = 0; i < planCount; i++) {
+          acc += scheduleDelays[i];
+          planned.push(new Date(Date.now() + acc * 1000).toISOString());
+        }
+        getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
+      } catch {}
+    }
 
     const attemptedPhones = new Set();
 
     for (let i = 0; i < messageLimit; i++) {
+      if (stopRequests.has(clientSlug)) { manualStop = true; break; }
       if (i >= remainingToday) {
         console.log(`[${clientSlug}] Cota diária atingida durante o ciclo. Encerrando.`);
         break;
@@ -1098,8 +1143,11 @@ async function runLoopForClient(clientSlug, opts = {}) {
         console.log(
           `[${clientSlug}] Aguardando ${delaySec}s (${when.toTimeString().split(' ')[0]}) para enviar a mensagem ${i + 1}/${messageLimit}.`
         );
-        await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
+        const slept = await sleepAbortable(delaySec * 1000, clientSlug);
+        if (slept === 'aborted') { manualStop = true; break; }
       }
+
+      if (stopRequests.has(clientSlug)) { manualStop = true; break; }
 
       // Seleciona próximo contato, ignorando os já tentados nesse ciclo
       let whereNotIn = '';
@@ -1121,27 +1169,32 @@ async function runLoopForClient(clientSlug, opts = {}) {
       attemptedPhones.add(phone);
 
       let sendRes = null;
-      if (useIA) {
-        sendRes = await runIAForContact({
-          client: clientSlug,
-          name,
-          phone,
-          instanceUrl: settings.instance_url,
-          instanceToken: settings.instance_token,
-          instanceAuthHeader: settings.instance_auth_header,
-          instanceAuthScheme: settings.instance_auth_scheme,
-        });
-        if (!sendRes.ok) {
-          console.warn(`[${clientSlug}] IA retornou erro para ${phone}. NÃO será marcado como enviado.`);
+      let status = 'skipped';
+      let shouldMark = false;
+
+      if (!manualStop) {
+        if (useIA) {
+          sendRes = await runIAForContact({
+            client: clientSlug,
+            name,
+            phone,
+            instanceUrl: settings.instance_url,
+            instanceToken: settings.instance_token,
+            instanceAuthHeader: settings.instance_auth_header,
+            instanceAuthScheme: settings.instance_auth_scheme,
+          });
+          status = sendRes && sendRes.ok ? 'success' : 'error';
+          shouldMark = status === 'success';
+        } else {
+          // Sem IA: política antiga era marcar? Mantém "skipped"
+          status = 'skipped';
+          shouldMark = false;
         }
       }
 
-      // Apenas marca como enviado quando houver sucesso real
-      let status = 'skipped';
-      if (useIA) status = sendRes && sendRes.ok ? 'success' : 'error';
-      const shouldMark = status === 'success';
+      if (stopRequests.has(clientSlug)) { manualStop = true; }
 
-      if (shouldMark) {
+      if (shouldMark && !manualStop) {
         try {
           await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
         } catch (err) {
@@ -1155,24 +1208,25 @@ async function runLoopForClient(clientSlug, opts = {}) {
         } catch (err) {
           console.error('Erro ao atualizar histórico', clientSlug, phone, err);
         }
-      } else {
+        processed++;
+      } else if (!manualStop) {
         console.warn(`[${clientSlug}] NÃO marcou como enviada (${status}). Mantendo na fila: ${phone}`);
       }
-
-      if (shouldMark) processed++;
 
       try {
         const evt = {
           type: 'item',
           name,
           phone,
-          ok: shouldMark,
-          status,
+          ok: shouldMark && !manualStop,
+          status: manualStop ? 'stopped' : status,
           at: new Date().toISOString(),
         };
         snapshotPush(clientSlug, evt);
         getEmitter(clientSlug).emit('progress', evt);
       } catch {}
+
+      if (manualStop) break;
     }
 
     // Ao final, atualiza status
@@ -1184,15 +1238,25 @@ async function runLoopForClient(clientSlug, opts = {}) {
     );
 
     try {
-      snapshotEnd(clientSlug, processed);
-      getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString() });
+      snapshotEnd(clientSlug, processed, manualStop ? { reason: 'manual_stop' } : {});
+      getEmitter(clientSlug).emit('progress', {
+        type: 'end',
+        processed,
+        at: new Date().toISOString(),
+        ...(manualStop ? { reason: 'manual_stop' } : {})
+      });
     } catch {}
 
-    return { processed, status: 'ok' };
+    if (manualStop) {
+      console.log(`[${clientSlug}] Loop encerrado manualmente.`);
+    }
+
+    return { processed, status: manualStop ? 'stopped' : 'ok' };
   } catch (err) {
     console.error('Erro no runLoopForClient', clientSlug, err);
     return { processed: 0, status: 'error' };
   } finally {
+    stopRequests.delete(clientSlug);
     runningClients.delete(clientSlug);
   }
 }
