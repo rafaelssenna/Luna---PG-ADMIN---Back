@@ -1,117 +1,104 @@
-// leadsSearcher.js — v2 (SSE/chunk + idle-timeout, JSON-aware)
+// leadsSearcher.js — robusto (SSE/chunk + idle-timeout + JSON)
 require('dotenv').config();
 
-/**
- * ENVs:
- *  SMARTLEADS_URL="https://web-production-e49bb.up.railway.app"
- *  SMARTLEADS_SEARCH_PATH="/leads/stream"
- *  SMARTLEADS_METHOD="GET"
- *
- *  SMARTLEADS_QS_REGION="local"
- *  SMARTLEADS_QS_NICHE="nicho"
- *  SMARTLEADS_QS_LIMIT="n"
- *  SMARTLEADS_QS_VERIFY="verify"
- *
- *  SMARTLEADS_TOKEN=""                         // se não precisar, deixe vazio
- *  SMARTLEADS_TOKEN_QS_KEYS="access,token,authorization"
- *
- *  SMARTLEADS_EXTRA_QUERY='{"sid":"shared","session_id":"shared"}'
- *  SMARTLEADS_TIMEOUT_MS="180000"              // idle-timeout (ms) – reinicia a cada chunk
- */
+/* ENVs usadas */
+var BASE    = process.env.SMARTLEADS_URL || "";
+var PATH    = process.env.SMARTLEADS_SEARCH_PATH || "/leads/stream";
+var METHOD  = String(process.env.SMARTLEADS_METHOD || "GET").toUpperCase();
 
-const BASE    = process.env.SMARTLEADS_URL || "";
-const PATH    = process.env.SMARTLEADS_SEARCH_PATH || "/leads/stream";
-const METHOD  = (process.env.SMARTLEADS_METHOD || "GET").toUpperCase();
+var QS_REGION = process.env.SMARTLEADS_QS_REGION || "local";
+var QS_NICHE  = process.env.SMARTLEADS_QS_NICHE  || "nicho";
+var QS_LIMIT  = process.env.SMARTLEADS_QS_LIMIT  || "n";
+var QS_VERIFY = process.env.SMARTLEADS_QS_VERIFY || "verify";
 
-const QS_REGION = process.env.SMARTLEADS_QS_REGION || "local";
-const QS_NICHE  = process.env.SMARTLEADS_QS_NICHE  || "nicho";
-const QS_LIMIT  = process.env.SMARTLEADS_QS_LIMIT  || "n";
-const QS_VERIFY = process.env.SMARTLEADS_QS_VERIFY || "verify";
+var EXTRA_QUERY = safeJson(process.env.SMARTLEADS_EXTRA_QUERY) || { sid: "shared", session_id: "shared" };
 
-const EXTRA_QUERY = safeJson(process.env.SMARTLEADS_EXTRA_QUERY) || { sid: "shared", session_id: "shared" };
+var TOKEN        = process.env.SMARTLEADS_TOKEN || "";
+var TOKEN_QS_KEYS = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,authorization")
+  .split(","); // não faço trim aqui por compat, abaixo trato
 
-const TOKEN          = process.env.SMARTLEADS_TOKEN || "";
-const TOKEN_QS_KEYS  = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,authorization")
-  .split(",").map(s => s.trim()).filter(Boolean);
+var TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
+var DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
 
-const TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
-const DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
-
-/* ---------- utils ---------- */
+/* ---- utils ---- */
 function safeJson(s){
   if (!s) return null;
-  let t = String(s).trim();
+  var t = String(s).trim();
   // remove aspas externas
-  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+  if ((t.charAt(0) === '"' && t.charAt(t.length-1) === '"') || (t.charAt(0) === "'" && t.charAt(t.length-1) === "'")) {
     t = t.slice(1, -1);
   }
   // desescapa \" e normaliza aspas simples -> duplas
-  try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch {}
-  try { return JSON.parse(t); } catch { return null; }
+  try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch (e) {}
+  try { return JSON.parse(t); } catch (e) { return null; }
 }
 
+var _fetch = null;
 async function doFetch(url, opts){
-  if (typeof fetch === "function") return fetch(url, opts);      // nativo (Node 18+ / undici)
+  if (_fetch) return _fetch(url, opts);
+  if (typeof fetch === "function") { _fetch = fetch; return _fetch(url, opts); }
   try {
-    // eslint-disable-next-line global-require
-    const nf = require("node-fetch");                            // commonjs
-    return nf(url, opts);
-  } catch {
-    const mod = await import("node-fetch");                      // dynamic import
-    return mod.default(url, opts);
+    _fetch = require("node-fetch"); // v2 (commonjs)
+    return _fetch(url, opts);
+  } catch (e) {
+    var mod = await import("node-fetch"); // v3 (esm)
+    _fetch = mod.default;
+    return _fetch(url, opts);
   }
 }
 
-function genDevice(prefix="WEB"){ return `${prefix}-${Math.random().toString(36).slice(2,12)}`; }
+function genDevice(prefix){ prefix = prefix || "WEB"; return prefix + "-" + Math.random().toString(36).slice(2,12); }
 function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
 
 function pushCandidate(out, obj, region, niche){
-  const phone = normalizeDigits(obj?.phone ?? obj?.telefone ?? obj?.number ?? obj?.whatsapp ?? "");
+  var phone = normalizeDigits((obj && (obj.phone || obj.telefone || obj.number || obj.whatsapp)) || "");
   if (!phone) return;
   out.push({
-    name: obj?.name ?? obj?.nome ?? "",
-    phone,
-    region: obj?.region ?? region ?? null,
-    niche:  obj?.niche  ?? obj?.segment ?? niche ?? null,
+    name: (obj && (obj.name || obj.nome)) || "",
+    phone: phone,
+    region: (obj && obj.region) || region || null,
+    niche:  (obj && (obj.niche || obj.segment)) || niche || null
   });
 }
 
 function parsePhonesInText(out, text, region, niche){
-  const matches = String(text||"").match(/\+?\d[\d\-\s\(\)]{8,}\d/g) || [];
-  for(const m of matches){
-    const phone = normalizeDigits(m);
+  var matches = String(text||"").match(/\+?\d[\d\-\s\(\)]{8,}\d/g) || [];
+  for (var i=0; i<matches.length; i++){
+    var phone = normalizeDigits(matches[i]);
     if (phone.length >= 10 && phone.length <= 14) {
-      out.push({ name:"", phone, region: region || null, niche: niche || null });
+      out.push({ name:"", phone: phone, region: region || null, niche: niche || null });
     }
   }
 }
 
-/* ---------- leitura de stream ---------- */
-async function readStream(resp, { region, niche }, onActivity){
-  const out = [];
-  const body = resp.body;
+/* leitura de stream */
+async function readStream(resp, ctx, onActivity){
+  var region = ctx.region, niche = ctx.niche;
+  var out = [];
+  var body = resp.body;
 
   if (body && typeof body.getReader === "function"){
-    const reader = body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
+    var reader = body.getReader();
+    var decoder = new TextDecoder("utf-8");
+    var buf = "";
 
     while (true){
-      const { value, done } = await reader.read();
+      var res = await reader.read();
+      var value = res.value, done = res.done;
       if (done) break;
       onActivity();
 
       buf += decoder.decode(value, { stream: true });
-      let idx;
+      var idx;
       while ((idx = buf.indexOf("\n")) >= 0){
-        const line = buf.slice(0, idx).trim();
+        var line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line) continue;
 
-        if (line.startsWith("data:")){
-          const raw = line.slice(5).trim();
+        if (line.indexOf("data:") === 0){
+          var raw = line.slice(5).trim();
           try { pushCandidate(out, JSON.parse(raw), region, niche); }
-          catch { parsePhonesInText(out, raw, region, niche); }
+          catch (e) { parsePhonesInText(out, raw, region, niche); }
         } else {
           parsePhonesInText(out, line, region, niche);
         }
@@ -120,13 +107,14 @@ async function readStream(resp, { region, niche }, onActivity){
     }
     if (buf.trim().length){ parsePhonesInText(out, buf.trim(), region, niche); onActivity(); }
   } else {
-    const text = await resp.text();
-    const lines = String(text).split(/\r?\n/);
-    for(const ln of lines){
-      if (ln.startsWith("data:")){
-        const raw = ln.slice(5).trim();
+    var text = await resp.text();
+    var lines = String(text).split(/\r?\n/);
+    for (var j=0; j<lines.length; j++){
+      var ln = lines[j];
+      if (ln.indexOf("data:") === 0){
+        var raw = ln.slice(5).trim();
         try { pushCandidate(out, JSON.parse(raw), region, niche); }
-        catch { parsePhonesInText(out, raw, region, niche); }
+        catch (e) { parsePhonesInText(out, raw, region, niche); }
       } else {
         parsePhonesInText(out, ln, region, niche);
       }
@@ -134,92 +122,117 @@ async function readStream(resp, { region, niche }, onActivity){
     }
   }
 
-  const seen = new Set();
-  return out.filter(it => { if (!it.phone || seen.has(it.phone)) return false; seen.add(it.phone); return true; });
+  // dedup
+  var seen = Object.create(null);
+  var out2 = [];
+  for (var k=0; k<out.length; k++){
+    var it = out[k];
+    if (!it.phone || seen[it.phone]) continue;
+    seen[it.phone] = 1;
+    out2.push(it);
+  }
+  return out2;
 }
 
 function makeIdleController(timeoutMs){
-  const ctrl = new AbortController();
-  let t = null;
-  const arm = ()=>{ clearTimeout(t); t = setTimeout(()=> ctrl.abort(new Error("idle-timeout")), timeoutMs); };
+  var ctrl = new AbortController();
+  var t = null;
+  function arm(){ clearTimeout(t); t = setTimeout(function(){ ctrl.abort(new Error("idle-timeout")); }, timeoutMs); }
   arm();
-  return { signal: ctrl.signal, activity: arm, dispose: ()=> clearTimeout(t) };
+  return { signal: ctrl.signal, activity: arm, dispose: function(){ clearTimeout(t); } };
 }
 
-/* ---------- mapeamento JSON "puro" (não-SSE) ---------- */
+/* JSON puro (não-SSE) */
 function mapJsonPayload(data, region, niche){
-  const out = [];
+  var out = [];
   if (Array.isArray(data)) {
-    data.forEach(it => pushCandidate(out, it, region, niche));
+    for (var i=0;i<data.length;i++) pushCandidate(out, data[i], region, niche);
     return out;
   }
   if (data && typeof data === "object") {
-    const keys = ["items", "results", "leads", "data"];
-    for (const k of keys) {
-      if (Array.isArray(data[k])) {
-        data[k].forEach(it => pushCandidate(out, it, region, niche));
+    var keys = ["items", "results", "leads", "data"];
+    for (var j=0;j<keys.length;j++){
+      var arr = data[keys[j]];
+      if (Array.isArray(arr)) {
+        for (var i2=0;i2<arr.length;i2++) pushCandidate(out, arr[i2], region, niche);
         return out;
       }
     }
-    // fallback: extrair números do JSON serializado
     parsePhonesInText(out, JSON.stringify(data), region, niche);
   }
   return out;
 }
 
-/* ---------- API ---------- */
-/**
- * searchLeads({ region, niche, limit }) -> Promise<Array<{name?, phone, region?, niche?}>>
- */
-async function searchLeads({ region, niche, limit=100 } = {}){
+/* API */
+async function searchLeads(opts){
+  opts = opts || {};
+  var region = opts.region, niche = opts.niche, limit = opts.limit || 100;
+
   if (!BASE){ console.warn("[leadsSearcher] SMARTLEADS_URL não configurada."); return []; }
   if (METHOD !== "GET"){ console.warn("[leadsSearcher] Use SMARTLEADS_METHOD=GET para stream."); }
 
-  // monta URL GET
-  const u = new URL(PATH, BASE);
-  if (region) u.searchParams.set(QS_REGION, region);
-  if (niche)  u.searchParams.set(QS_NICHE,  niche);
+  var u = new URL(PATH, BASE);
+  if (region) u.searchParams.set(QS_REGION, String(region));
+  if (niche)  u.searchParams.set(QS_NICHE,  String(niche));
   if (limit)  u.searchParams.set(QS_LIMIT,  String(limit));
   if (QS_VERIFY) u.searchParams.set(QS_VERIFY, "1");
 
-  if (TOKEN && TOKEN_QS_KEYS.length){
-    for (const k of TOKEN_QS_KEYS) u.searchParams.set(k, TOKEN);
+  if (TOKEN) {
+    for (var i=0;i<TOKEN_QS_KEYS.length;i++){
+      var key = (TOKEN_QS_KEYS[i] || "").trim();
+      if (key) u.searchParams.set(key, TOKEN);
+    }
   }
 
-  const extra = EXTRA_QUERY || {};
-  const device = extra.device || genDevice("WEB");
-  const deviceId = extra.device_id || device;
-  Object.entries({ ...extra, device, device_id: deviceId }).forEach(([k,v])=>{
-    if (v != null) u.searchParams.set(String(k), String(v));
-  });
+  var extra = EXTRA_QUERY || {};
+  var device = extra.device || genDevice("WEB");
+  var deviceId = extra.device_id || device;
+  var all = Object.assign({}, extra, { device: device, device_id: deviceId });
+  for (var k in all){
+    if (Object.prototype.hasOwnProperty.call(all,k) && all[k] != null){
+      u.searchParams.set(String(k), String(all[k]));
+    }
+  }
 
   if (DEBUG) console.log("[LEADS] URL:", u.toString());
 
-  const idle = makeIdleController(TIMEOUT_MS);
+  var idle = makeIdleController(TIMEOUT_MS);
   try {
-    const resp = await doFetch(u.toString(), {
+    var resp = await doFetch(u.toString(), {
       method: "GET",
       headers: { "Accept": "application/json, text/event-stream, text/plain" },
-      signal: idle.signal,
+      signal: idle.signal
     });
 
-    const ct = String(resp.headers?.get?.("content-type") || "").toLowerCase();
+    var ct = (resp && resp.headers && resp.headers.get && resp.headers.get("content-type")) || "";
+    ct = String(ct).toLowerCase();
     if (DEBUG) console.log("[LEADS] HTTP:", resp.status, ct);
 
     if (!resp.ok){
-      const body = await safeText(resp);
-      console.warn("[leadsSearcher] HTTP", resp.status, body?.slice?.(0,200) || "");
+      var body = await safeText(resp);
+      console.warn("[leadsSearcher] HTTP", resp.status, (body && body.slice) ? body.slice(0,200) : "");
       return [];
     }
 
-    // JSON puro
-    if (ct.includes("application/json")) {
-      const data = await resp.json();
+    if (ct.indexOf("application/json") >= 0) {
+      var data = await resp.json();
       return mapJsonPayload(data, region, niche);
     }
 
-    // SSE / texto
-    const results = await readStream(resp, { region, niche }, idle.activity);
+    var results = await readStream(resp, { region: region, niche: niche }, idle.activity);
     return results;
   } catch (err){
-    if (String(err?.messag
+    if ((err && String(err.message).indexOf("idle-timeout") >= 0)){
+      console.warn("[leadsSearcher] idle-timeout — finalizando stream sem erro");
+      return [];
+    }
+    console.error("[leadsSearcher] erro:", (err && err.message) || err);
+    return [];
+  } finally {
+    idle.dispose();
+  }
+}
+
+async function safeText(r){ try { return await r.text(); } catch (e) { return ""; } }
+
+module.exports = { searchLeads };
