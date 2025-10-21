@@ -1,9 +1,7 @@
-// leadsSearcher.js — v2 (SSE/chunk + idle-timeout)
+// leadsSearcher.js — v2 (SSE/chunk + idle-timeout, JSON-aware)
 require('dotenv').config();
 
 /**
- * Integração com o seu back de stream (GET /leads/stream? ...):
- *
  * ENVs:
  *  SMARTLEADS_URL="https://web-production-e49bb.up.railway.app"
  *  SMARTLEADS_SEARCH_PATH="/leads/stream"
@@ -37,30 +35,29 @@ const TOKEN_QS_KEYS  = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,au
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
+const DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
 
+/* ---------- utils ---------- */
 function safeJson(s){
   if (!s) return null;
   let t = String(s).trim();
-  // remove aspas externas se o painel colocou
+  // remove aspas externas
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
     t = t.slice(1, -1);
   }
-  // desescapa \" e normaliza aspas simples para duplas (Railway às vezes salva assim)
+  // desescapa \" e normaliza aspas simples -> duplas
   try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch {}
   try { return JSON.parse(t); } catch { return null; }
 }
 
 async function doFetch(url, opts){
-  // fetch nativo (Node 18+/undici)
-  if (typeof fetch === "function") return fetch(url, opts);
+  if (typeof fetch === "function") return fetch(url, opts);      // nativo (Node 18+ / undici)
   try {
-    // commonjs
     // eslint-disable-next-line global-require
-    const nf = require("node-fetch");
+    const nf = require("node-fetch");                            // commonjs
     return nf(url, opts);
   } catch {
-    // dynamic import
-    const mod = await import("node-fetch");
+    const mod = await import("node-fetch");                      // dynamic import
     return mod.default(url, opts);
   }
 }
@@ -69,13 +66,13 @@ function genDevice(prefix="WEB"){ return `${prefix}-${Math.random().toString(36)
 function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
 
 function pushCandidate(out, obj, region, niche){
-  const phone = normalizeDigits(obj.phone || obj.telefone || obj.number || obj.whatsapp || "");
+  const phone = normalizeDigits(obj?.phone ?? obj?.telefone ?? obj?.number ?? obj?.whatsapp ?? "");
   if (!phone) return;
   out.push({
-    name: obj.name || obj.nome || "",
+    name: obj?.name ?? obj?.nome ?? "",
     phone,
-    region: obj.region || region || null,
-    niche:  obj.niche  || obj.segment || niche || null,
+    region: obj?.region ?? region ?? null,
+    niche:  obj?.niche  ?? obj?.segment ?? niche ?? null,
   });
 }
 
@@ -89,7 +86,7 @@ function parsePhonesInText(out, text, region, niche){
   }
 }
 
-/** lê o stream; chama onActivity() a cada byte/linha para resetar o idle-timer */
+/* ---------- leitura de stream ---------- */
 async function readStream(resp, { region, niche }, onActivity){
   const out = [];
   const body = resp.body;
@@ -149,6 +146,28 @@ function makeIdleController(timeoutMs){
   return { signal: ctrl.signal, activity: arm, dispose: ()=> clearTimeout(t) };
 }
 
+/* ---------- mapeamento JSON "puro" (não-SSE) ---------- */
+function mapJsonPayload(data, region, niche){
+  const out = [];
+  if (Array.isArray(data)) {
+    data.forEach(it => pushCandidate(out, it, region, niche));
+    return out;
+  }
+  if (data && typeof data === "object") {
+    const keys = ["items", "results", "leads", "data"];
+    for (const k of keys) {
+      if (Array.isArray(data[k])) {
+        data[k].forEach(it => pushCandidate(out, it, region, niche));
+        return out;
+      }
+    }
+    // fallback: extrair números do JSON serializado
+    parsePhonesInText(out, JSON.stringify(data), region, niche);
+  }
+  return out;
+}
+
+/* ---------- API ---------- */
 /**
  * searchLeads({ region, niche, limit }) -> Promise<Array<{name?, phone, region?, niche?}>>
  */
@@ -174,13 +193,18 @@ async function searchLeads({ region, niche, limit=100 } = {}){
     if (v != null) u.searchParams.set(String(k), String(v));
   });
 
+  if (DEBUG) console.log("[LEADS] URL:", u.toString());
+
   const idle = makeIdleController(TIMEOUT_MS);
   try {
     const resp = await doFetch(u.toString(), {
       method: "GET",
-      headers: { "Accept": "text/event-stream, text/plain, application/json" },
+      headers: { "Accept": "application/json, text/event-stream, text/plain" },
       signal: idle.signal,
     });
+
+    const ct = String(resp.headers?.get?.("content-type") || "").toLowerCase();
+    if (DEBUG) console.log("[LEADS] HTTP:", resp.status, ct);
 
     if (!resp.ok){
       const body = await safeText(resp);
@@ -188,20 +212,14 @@ async function searchLeads({ region, niche, limit=100 } = {}){
       return [];
     }
 
+    // JSON puro
+    if (ct.includes("application/json")) {
+      const data = await resp.json();
+      return mapJsonPayload(data, region, niche);
+    }
+
+    // SSE / texto
     const results = await readStream(resp, { region, niche }, idle.activity);
     return results;
   } catch (err){
-    if (String(err?.message || "").includes("idle-timeout")){
-      console.warn("[leadsSearcher] idle-timeout — finalizando stream sem erro");
-      return [];
-    }
-    console.error("[leadsSearcher] erro:", err?.message || err);
-    return [];
-  } finally {
-    idle.dispose();
-  }
-}
-
-async function safeText(r){ try { return await r.text(); } catch { return ""; } }
-
-module.exports = { searchLeads };
+    if (String(err?.messag
