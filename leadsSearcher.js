@@ -197,9 +197,15 @@ async function searchLeads(opts){
     }
   }
 
+  // extras + device; se vier "shared" gera sid único por chamada
   var extra = EXTRA_QUERY || {};
   var device = extra.device || genDevice("WEB");
   var deviceId = extra.device_id || device;
+
+  var unique = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,7);
+  if (!extra.sid || String(extra.sid).toLowerCase() === 'shared')        extra.sid = 'sid-' + unique;
+  if (!extra.session_id || String(extra.session_id).toLowerCase() === 'shared') extra.session_id = 'sid-' + unique;
+
   var all = Object.assign({}, extra, { device: device, device_id: deviceId });
   for (var k in all){
     if (Object.prototype.hasOwnProperty.call(all,k) && all[k] != null){
