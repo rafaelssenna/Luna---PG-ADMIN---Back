@@ -13,39 +13,27 @@ var QS_VERIFY = process.env.SMARTLEADS_QS_VERIFY || "verify";
 
 var EXTRA_QUERY = safeJson(process.env.SMARTLEADS_EXTRA_QUERY) || { sid: "shared", session_id: "shared" };
 
-var TOKEN        = process.env.SMARTLEADS_TOKEN || "";
-var TOKEN_QS_KEYS = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,authorization")
-  .split(","); // trim aplicado no loop
+var TOKEN         = process.env.SMARTLEADS_TOKEN || "";
+var TOKEN_QS_KEYS = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,authorization").split(",");
 
-// idle-timeout (reinicia a cada chunk). Se o stream ficar mudo por TIMEOUT_MS, aborta.
 var TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
 var DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
 
-/* ---- utils ---- */
+/* ---------- utils ---------- */
 function safeJson(s){
   if (!s) return null;
   var t = String(s).trim();
-  // remove aspas externas
-  if ((t.charAt(0) === '"' && t.charAt(t.length-1) === '"') || (t.charAt(0) === "'" && t.charAt(t.length-1) === "'")) {
-    t = t.slice(1, -1);
-  }
-  // desescapa \" e normaliza aspas simples -> duplas
-  try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch (e) {}
-  try { return JSON.parse(t); } catch (e) { return null; }
+  if ((t[0] === '"' && t[t.length-1] === '"') || (t[0] === "'" && t[t.length-1] === "'")) t = t.slice(1, -1);
+  try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch {}
+  try { return JSON.parse(t); } catch { return null; }
 }
 
 var _fetch = null;
 async function doFetch(url, opts){
   if (_fetch) return _fetch(url, opts);
   if (typeof fetch === "function") { _fetch = fetch; return _fetch(url, opts); }
-  try {
-    _fetch = require("node-fetch"); // v2 (commonjs)
-    return _fetch(url, opts);
-  } catch (e) {
-    var mod = await import("node-fetch"); // v3 (esm)
-    _fetch = mod.default;
-    return _fetch(url, opts);
-  }
+  try { _fetch = require("node-fetch"); return _fetch(url, opts); }
+  catch { const mod = await import("node-fetch"); _fetch = mod.default; return _fetch(url, opts); }
 }
 
 function genDevice(prefix){ prefix = prefix || "WEB"; return prefix + "-" + Math.random().toString(36).slice(2,12); }
@@ -55,9 +43,8 @@ function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
 function normalizeRegionInput(s){
   if (!s) return s;
   var m = String(s).trim().toLowerCase();
-  if (m === "bh" || m === "bh/mg" || m === "b.h." || m === "b h") return "Belo Horizonte";
+  if (m === "bh" || m === "bh/mg" || m === "b.h." || m === "b h" || m === "bh mg") return "Belo Horizonte";
   if (m === "belo horizonte mg" || m === "belo horizonte, mg") return "Belo Horizonte";
-  // deixe outros valores como usuário digitou
   return s;
 }
 
@@ -65,8 +52,8 @@ function pushCandidate(out, obj, region, niche){
   var phone = normalizeDigits((obj && (obj.phone || obj.telefone || obj.number || obj.whatsapp)) || "");
   if (!phone) return;
   out.push({
-    name: (obj && (obj.name || obj.nome)) || "",
-    phone: phone,
+    name:   (obj && (obj.name || obj.nome)) || "",
+    phone:  phone,
     region: (obj && obj.region) || region || null,
     niche:  (obj && (obj.niche || obj.segment)) || niche || null
   });
@@ -94,12 +81,11 @@ async function readStream(resp, ctx, onActivity){
     var buf = "";
 
     while (true){
-      var res = await reader.read();
-      var value = res.value, done = res.done;
-      if (done) break;
+      var r = await reader.read();
+      if (r.done) break;
       onActivity();
 
-      buf += decoder.decode(value, { stream: true });
+      buf += decoder.decode(r.value, { stream: true });
       var idx;
       while ((idx = buf.indexOf("\n")) >= 0){
         var line = buf.slice(0, idx).trim();
@@ -109,7 +95,7 @@ async function readStream(resp, ctx, onActivity){
         if (line.indexOf("data:") === 0){
           var raw = line.slice(5).trim();
           try { pushCandidate(out, JSON.parse(raw), region, niche); }
-          catch (e) { parsePhonesInText(out, raw, region, niche); }
+          catch { parsePhonesInText(out, raw, region, niche); }
         } else {
           parsePhonesInText(out, line, region, niche);
         }
@@ -125,7 +111,7 @@ async function readStream(resp, ctx, onActivity){
       if (ln.indexOf("data:") === 0){
         var raw = ln.slice(5).trim();
         try { pushCandidate(out, JSON.parse(raw), region, niche); }
-        catch (e) { parsePhonesInText(out, raw, region, niche); }
+        catch { parsePhonesInText(out, raw, region, niche); }
       } else {
         parsePhonesInText(out, ln, region, niche);
       }
@@ -133,9 +119,7 @@ async function readStream(resp, ctx, onActivity){
     }
   }
 
-  // dedup
-  var seen = Object.create(null);
-  var out2 = [];
+  var seen = Object.create(null), out2 = [];
   for (var k=0; k<out.length; k++){
     var it = out[k];
     if (!it.phone || seen[it.phone]) continue;
@@ -156,18 +140,12 @@ function makeIdleController(timeoutMs){
 /* JSON puro (não-SSE) */
 function mapJsonPayload(data, region, niche){
   var out = [];
-  if (Array.isArray(data)) {
-    for (var i=0;i<data.length;i++) pushCandidate(out, data[i], region, niche);
-    return out;
-  }
+  if (Array.isArray(data)) { for (var i=0;i<data.length;i++) pushCandidate(out, data[i], region, niche); return out; }
   if (data && typeof data === "object") {
     var keys = ["items", "results", "leads", "data"];
     for (var j=0;j<keys.length;j++){
       var arr = data[keys[j]];
-      if (Array.isArray(arr)) {
-        for (var i2=0;i2<arr.length;i2++) pushCandidate(out, arr[i2], region, niche);
-        return out;
-      }
+      if (Array.isArray(arr)) { for (var i2=0;i2<arr.length;i2++) pushCandidate(out, arr[i2], region, niche); return out; }
     }
     parsePhonesInText(out, JSON.stringify(data), region, niche);
   }
@@ -252,6 +230,6 @@ async function searchLeads(opts){
   }
 }
 
-async function safeText(r){ try { return await r.text(); } catch (e) { return ""; } }
+async function safeText(r){ try { return await r.text(); } catch { return ""; } }
 
 module.exports = { searchLeads };
