@@ -1,4 +1,4 @@
-// leadsSearcher.js — robusto (SSE/chunk + idle-timeout + JSON)
+// leadsSearcher.js — robusto (SSE/chunk + idle-timeout + JSON + normalizeRegion)
 require('dotenv').config();
 
 /* ENVs usadas */
@@ -15,8 +15,9 @@ var EXTRA_QUERY = safeJson(process.env.SMARTLEADS_EXTRA_QUERY) || { sid: "shared
 
 var TOKEN        = process.env.SMARTLEADS_TOKEN || "";
 var TOKEN_QS_KEYS = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,authorization")
-  .split(","); // não faço trim aqui por compat, abaixo trato
+  .split(","); // trim aplicado no loop
 
+// idle-timeout (reinicia a cada chunk). Se o stream ficar mudo por TIMEOUT_MS, aborta.
 var TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
 var DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
 
@@ -49,6 +50,16 @@ async function doFetch(url, opts){
 
 function genDevice(prefix){ prefix = prefix || "WEB"; return prefix + "-" + Math.random().toString(36).slice(2,12); }
 function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
+
+/* normaliza região digitada (ex.: "bh" -> "Belo Horizonte") */
+function normalizeRegionInput(s){
+  if (!s) return s;
+  var m = String(s).trim().toLowerCase();
+  if (m === "bh" || m === "bh/mg" || m === "b.h." || m === "b h") return "Belo Horizonte";
+  if (m === "belo horizonte mg" || m === "belo horizonte, mg") return "Belo Horizonte";
+  // deixe outros valores como usuário digitou
+  return s;
+}
 
 function pushCandidate(out, obj, region, niche){
   var phone = normalizeDigits((obj && (obj.phone || obj.telefone || obj.number || obj.whatsapp)) || "");
@@ -166,7 +177,9 @@ function mapJsonPayload(data, region, niche){
 /* API */
 async function searchLeads(opts){
   opts = opts || {};
-  var region = opts.region, niche = opts.niche, limit = opts.limit || 100;
+  var region = normalizeRegionInput(opts.region);
+  var niche  = opts.niche;
+  var limit  = opts.limit || 100;
 
   if (!BASE){ console.warn("[leadsSearcher] SMARTLEADS_URL não configurada."); return []; }
   if (METHOD !== "GET"){ console.warn("[leadsSearcher] Use SMARTLEADS_METHOD=GET para stream."); }
