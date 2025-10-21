@@ -14,11 +14,11 @@ require('dotenv').config();
  *  SMARTLEADS_QS_LIMIT="n"
  *  SMARTLEADS_QS_VERIFY="verify"
  *
- *  SMARTLEADS_TOKEN=""                         # se não precisar, deixe vazio
+ *  SMARTLEADS_TOKEN=""                         // se não precisar, deixe vazio
  *  SMARTLEADS_TOKEN_QS_KEYS="access,token,authorization"
  *
  *  SMARTLEADS_EXTRA_QUERY='{"sid":"shared","session_id":"shared"}'
- *  SMARTLEADS_TIMEOUT_MS="180000"              # idle-timeout (ms) – reinicia a cada chunk
+ *  SMARTLEADS_TIMEOUT_MS="180000"              // idle-timeout (ms) – reinicia a cada chunk
  */
 
 const BASE    = process.env.SMARTLEADS_URL || "";
@@ -39,7 +39,11 @@ const TOKEN_QS_KEYS  = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,au
 const TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
 
 function safeJson(s){ try { return s ? JSON.parse(s) : null; } catch { return null; } }
-async function doFetch(url, opts){ if (typeof fetch === "function") return fetch(url, opts); return (await import("node-fetch")).default(url, opts); }
+async function doFetch(url, opts){
+  if (typeof fetch === "function") return fetch(url, opts);
+  const mod = await import("node-fetch");
+  return mod.default(url, opts);
+}
 function genDevice(prefix="WEB"){ return `${prefix}-${Math.random().toString(36).slice(2,12)}`; }
 function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
 
