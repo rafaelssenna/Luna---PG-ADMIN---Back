@@ -505,7 +505,6 @@ function mapHeader(headerCells) {
 }
 
 /* ======================  ADIÇÃO: integração com buscador de leads  ====================== */
-/* Arquivo novo separado (leadsSearcher.js) encapsula a chamada ao serviço Smart-Leads */
 const { searchLeads } = require('./leadsSearcher');
 
 /** Garante que as tabelas do cliente tenham a coluna region (adição não destrutiva) */
@@ -522,6 +521,23 @@ async function ensureRegionColumns(slug) {
 
 /** Healthcheck */
 app.get('/api/healthz', (_req, res) => res.json({ up: true }));
+
+/* ---------- AQUI: NOVA ROTA DE BUSCA (SOMENTE CONSULTA, NÃO SALVA) ---------- */
+app.get('/api/leads/search', async (req, res) => {
+  try {
+    // Aceita tanto region/niche/limit quanto local/nicho/n (compat com o outro back)
+    const region = req.query.region || req.query.local || req.query.city || '';
+    const niche  = req.query.niche  || req.query.nicho || req.query.segment || '';
+    const limit  = parseInt(req.query.limit || req.query.n || '0', 10) || undefined;
+
+    const items = await searchLeads({ region, niche, limit });
+    return res.json({ items, count: items.length });
+  } catch (err) {
+    console.error('Erro em /api/leads/search', err);
+    return res.status(500).json({ error: 'Erro interno ao consultar leads' });
+  }
+});
+/* ---------- FIM: NOVA ROTA DE BUSCA ---------- */
 
 /** Lista clientes (slug e fila) + flags salvas */
 app.get('/api/clients', async (_req, res) => {
@@ -957,10 +973,7 @@ app.delete('/api/delete-client', async (req, res) => {
 });
 
 /* ======================  >>> ADIÇÃO: Parada manual do loop  ====================== */
-// conjunto de pedidos de parada (por cliente)
 const stopRequests = new Set();
-
-// sleep abortável que verifica sinal de parada a cada 250ms
 async function sleepAbortable(ms, slug) {
   const step = 250;
   let elapsed = 0;
@@ -1022,7 +1035,6 @@ app.post('/api/leads', async (req, res) => {
       if (!phone) { skipped++; continue; }
 
       try {
-        // Nova função no Postgres (vide seção SQL) — não altera a função existente
         const r = await pool.query(`SELECT client_add_lead($1,$2,$3,$4,$5) AS status;`,
           [client, name, phone, reg, nich]);
         const status = r.rows?.[0]?.status || 'inserted';
@@ -1251,7 +1263,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
           status = sendRes && sendRes.ok ? 'success' : 'error';
           shouldMark = status === 'success';
         } else {
-          // Sem IA: política antiga era marcar? Mantém "skipped"
           status = 'skipped';
           shouldMark = false;
         }
@@ -1327,9 +1338,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
 }
 
 /* =====================  Scheduler: Auto-run diário  ===================== */
-/**
- * Executa às 08:00 para todos os clientes com auto_run = true e fila > 0.
- */
 function scheduleDailyAutoRun() {
   const now = new Date();
   const nextRun = new Date(now);
@@ -1364,7 +1372,6 @@ function scheduleDailyAutoRun() {
 scheduleDailyAutoRun();
 
 /* =====================  Catch-all  ===================== */
-// Retorna 404 JSON (evita tentar servir index.html inexistente)
 app.get('*', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
 /* =====================  Boot  ===================== */
