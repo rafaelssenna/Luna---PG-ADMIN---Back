@@ -38,12 +38,33 @@ const TOKEN_QS_KEYS  = (process.env.SMARTLEADS_TOKEN_QS_KEYS || "access,token,au
 
 const TIMEOUT_MS = Math.max(15000, parseInt(process.env.SMARTLEADS_TIMEOUT_MS || "180000", 10));
 
-function safeJson(s){ try { return s ? JSON.parse(s) : null; } catch { return null; } }
-async function doFetch(url, opts){
-  if (typeof fetch === "function") return fetch(url, opts);
-  const mod = await import("node-fetch");
-  return mod.default(url, opts);
+function safeJson(s){
+  if (!s) return null;
+  let t = String(s).trim();
+  // remove aspas externas se o painel colocou
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    t = t.slice(1, -1);
+  }
+  // desescapa \" e normaliza aspas simples para duplas (Railway às vezes salva assim)
+  try { t = t.replace(/\\"/g, '"').replace(/'/g, '"'); } catch {}
+  try { return JSON.parse(t); } catch { return null; }
 }
+
+async function doFetch(url, opts){
+  // fetch nativo (Node 18+/undici)
+  if (typeof fetch === "function") return fetch(url, opts);
+  try {
+    // commonjs
+    // eslint-disable-next-line global-require
+    const nf = require("node-fetch");
+    return nf(url, opts);
+  } catch {
+    // dynamic import
+    const mod = await import("node-fetch");
+    return mod.default(url, opts);
+  }
+}
+
 function genDevice(prefix="WEB"){ return `${prefix}-${Math.random().toString(36).slice(2,12)}`; }
 function normalizeDigits(s){ return String(s||"").replace(/\D/g,""); }
 
