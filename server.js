@@ -1201,7 +1201,17 @@ async function runLoopForClient(clientSlug, opts = {}) {
           acc += scheduleDelays[i];
           planned.push(new Date(Date.now() + acc * 1000).toISOString());
         }
-        getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
+        // ===== ALTERAÇÃO: salvar + emitir o schedule =====
+        const scheduleEvt = {
+          type: 'schedule',
+          planned,
+          remainingToday,
+          cap: DAILY_MESSAGE_COUNT,
+          at: new Date().toISOString(),
+        };
+        try { snapshotPush(clientSlug, scheduleEvt); } catch {}
+        getEmitter(clientSlug).emit('progress', scheduleEvt);
+        // ===== FIM ALTERAÇÃO =====
       } catch {}
     }
 
