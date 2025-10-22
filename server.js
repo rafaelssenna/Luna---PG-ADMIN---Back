@@ -608,15 +608,23 @@ app.get('/api/sent-today', async (req, res) => {
 /** Lista clientes (slug e fila) + flags salvas */
 app.get('/api/clients', async (_req, res) => {
   try {
+    // Ao listar clientes, considere qualquer tabela "base" que possua uma
+    // tabela correspondente "_totais". Isso permite slugs sem o prefixo "cliente_".
     const result = await pool.query(
-      `SELECT table_name
-         FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_type = 'BASE TABLE'
-          AND table_name LIKE 'cliente\\_%'
-          AND table_name NOT LIKE '%\\_totais';`
+      `SELECT t.table_name AS slug
+         FROM information_schema.tables t
+        WHERE t.table_schema = 'public'
+          AND t.table_type   = 'BASE TABLE'
+          AND t.table_name NOT LIKE '%\\_totais'
+          AND EXISTS (
+                SELECT 1
+                  FROM information_schema.tables t2
+                 WHERE t2.table_schema = 'public'
+                   AND t2.table_name   = t.table_name || '_totais'
+          )
+        ORDER BY t.table_name;`
     );
-    const tables = result.rows.map((r) => r.table_name);
+    const tables = result.rows.map((r) => r.slug);
     const clients = [];
     for (const slug of tables) {
       try {
