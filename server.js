@@ -1112,6 +1112,85 @@ app.post('/api/leads', async (req, res) => {
   }
 });
 
+/* ======================  >>> ADIÇÃO: Renomear cliente (SLUG)  ====================== */
+/**
+ * Endpoint para renomear completamente um cliente.
+ * POST /api/rename-client
+ * Body: { oldSlug: string, newSlug: string }
+ *
+ * - Renomeia as tabelas "<oldSlug>" -> "<newSlug>" e "<oldSlug>_totais" -> "<newSlug>_totais"
+ * - Atualiza client_settings.slug
+ * - Ajusta estruturas em memória (SSE, estado de progresso, flags de stop/loop)
+ */
+app.post('/api/rename-client', async (req, res) => {
+  const oldSlug = req.body?.oldSlug;
+  const newSlug = req.body?.newSlug;
+
+  // Validação básica dos slugs
+  if (!validateSlug(oldSlug) || !validateSlug(newSlug)) {
+    return res.status(400).json({ error: 'Slugs inválidos. Use [a-z0-9_], 1..64 chars.' });
+  }
+  if (oldSlug === newSlug) {
+    return res.status(400).json({ error: 'oldSlug e newSlug são iguais.' });
+  }
+
+  try {
+    // Não renomear se o loop estiver em execução
+    if (runningClients.has(oldSlug)) {
+      return res.status(409).json({ error: `Loop em execução para ${oldSlug}. Pare antes de renomear.` });
+    }
+
+    // Verifica se tabelas antigas existem
+    const oldExists = await tableExists(oldSlug);
+    const oldTotExists = await tableExists(`${oldSlug}_totais`);
+    if (!oldExists || !oldTotExists) {
+      return res.status(404).json({ error: `Tabelas de ${oldSlug} não encontradas.` });
+    }
+
+    // Não permitir sobrescrever tabelas existentes
+    const newExists = await tableExists(newSlug);
+    const newTotExists = await tableExists(`${newSlug}_totais`);
+    if (newExists || newTotExists) {
+      return res.status(409).json({ error: `Já existem tabelas para ${newSlug}.` });
+    }
+
+    // Renomeia tabelas e ajusta client_settings
+    await pool.query('BEGIN');
+    await pool.query(`ALTER TABLE "${oldSlug}" RENAME TO "${newSlug}";`);
+    await pool.query(`ALTER TABLE "${oldSlug}_totais" RENAME TO "${newSlug}_totais";`);
+
+    const cs = await pool.query(`SELECT 1 FROM client_settings WHERE slug = $1;`, [oldSlug]);
+    if (cs.rowCount) {
+      await pool.query(`UPDATE client_settings SET slug = $1 WHERE slug = $2;`, [newSlug, oldSlug]);
+    } else {
+      // Cria registro padrão caso não exista
+      await pool.query(
+        `INSERT INTO client_settings (slug, loop_status, last_run_at) VALUES ($1, 'idle', NOW());`,
+        [newSlug]
+      );
+    }
+    await pool.query('COMMIT');
+
+    // Ajustar referências em memória para SSE e estados
+    if (progressEmitters.has(oldSlug)) {
+      progressEmitters.set(newSlug, progressEmitters.get(oldSlug));
+      progressEmitters.delete(oldSlug);
+    }
+    if (progressStates.has(oldSlug)) {
+      progressStates.set(newSlug, progressStates.get(oldSlug));
+      progressStates.delete(oldSlug);
+    }
+    stopRequests.delete(oldSlug);
+    runningClients.delete(oldSlug);
+
+    return res.json({ ok: true, oldSlug, newSlug });
+  } catch (err) {
+    console.error('Erro em /api/rename-client', err);
+    try { await pool.query('ROLLBACK'); } catch {}
+    return res.status(500).json({ error: 'Erro interno ao renomear cliente' });
+  }
+});
+
 /**
  * Endpoint para iniciar manualmente o loop de processamento de um cliente.
  * Espera body JSON: { client: 'cliente_x', iaAuto?: boolean }
