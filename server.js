@@ -169,13 +169,15 @@ CREATE TABLE IF NOT EXISTS client_settings (
   instance_auth_header TEXT,
   instance_auth_scheme TEXT,
   loop_status TEXT DEFAULT 'idle',
-  last_run_at TIMESTAMPTZ
+  last_run_at TIMESTAMPTZ,
+  daily_limit INTEGER DEFAULT 30
 );
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_token TEXT;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_header TEXT;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_scheme TEXT;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS loop_status TEXT DEFAULT 'idle';
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ;
+ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 30;
 `);
 }
 ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
@@ -183,7 +185,8 @@ ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
 async function getClientSettings(slug) {
   const { rows } = await pool.query(
     `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at,
-            instance_token, instance_auth_header, instance_auth_scheme
+            instance_token, instance_auth_header, instance_auth_scheme,
+            daily_limit
        FROM client_settings
       WHERE slug = $1`,
     [slug]
@@ -198,6 +201,7 @@ async function getClientSettings(slug) {
       instance_auth_scheme: null,
       loop_status: 'idle',
       last_run_at: null,
+      daily_limit: null,
     };
   }
   return rows[0];
@@ -205,12 +209,18 @@ async function getClientSettings(slug) {
 
 async function saveClientSettings(
   slug,
-  { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme }
+  { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme, dailyLimit }
 ) {
+  // sanitiza dailyLimit
+  const safeDaily =
+    Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0
+      ? Math.min(10000, Math.floor(Number(dailyLimit)))
+      : null;
+
   await pool.query(
     `INSERT INTO client_settings
-       (slug, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme)
-     VALUES ($1,   $2,       $3,     $4,           $5,             $6,                   $7)
+       (slug, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, daily_limit)
+     VALUES ($1,   $2,       $3,     $4,           $5,             $6,                   $7,             $8)
      ON CONFLICT (slug)
      DO UPDATE SET
        auto_run = EXCLUDED.auto_run,
@@ -218,7 +228,8 @@ async function saveClientSettings(
        instance_url = EXCLUDED.instance_url,
        instance_token = EXCLUDED.instance_token,
        instance_auth_header = EXCLUDED.instance_auth_header,
-       instance_auth_scheme = EXCLUDED.instance_auth_scheme`,
+       instance_auth_scheme = EXCLUDED.instance_auth_scheme,
+       daily_limit = COALESCE(EXCLUDED.daily_limit, client_settings.daily_limit)`,
     [
       slug,
       !!autoRun,
@@ -227,6 +238,7 @@ async function saveClientSettings(
       instanceToken || null,
       instanceAuthHeader || 'token',
       instanceAuthScheme ?? '',
+      safeDaily,
     ]
   );
 }
@@ -508,7 +520,20 @@ app.get('/api/loop-state', async (req, res) => {
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
 
   try {
-    const cap = DAILY_MESSAGE_COUNT;
+    let loop_status = 'idle', last_run_at = null, cap = DAILY_MESSAGE_COUNT;
+
+    try {
+      const r2 = await pool.query(
+        `SELECT loop_status, last_run_at, COALESCE(daily_limit, $2) AS cap
+           FROM client_settings WHERE slug = $1;`,
+        [slug, DAILY_MESSAGE_COUNT]
+      );
+      if (r2.rows[0]) {
+        loop_status = r2.rows[0].loop_status || 'idle';
+        last_run_at = r2.rows[0].last_run_at || null;
+        cap = Number(r2.rows[0].cap) || DAILY_MESSAGE_COUNT;
+      }
+    } catch {}
 
     let sent_today = 0;
     try {
@@ -519,18 +544,6 @@ app.get('/api/loop-state', async (req, res) => {
             AND updated_at::date = CURRENT_DATE;`
       );
       sent_today = Number(r.rows?.[0]?.c || 0);
-    } catch {}
-
-    let loop_status = 'idle', last_run_at = null;
-    try {
-      const r2 = await pool.query(
-        `SELECT loop_status, last_run_at FROM client_settings WHERE slug = $1;`,
-        [slug]
-      );
-      if (r2.rows[0]) {
-        loop_status = r2.rows[0].loop_status || 'idle';
-        last_run_at = r2.rows[0].last_run_at || null;
-      }
     } catch {}
 
     const remaining_today = Math.max(0, cap - sent_today);
@@ -631,7 +644,7 @@ app.get('/api/clients', async (_req, res) => {
         const [countRes, cfgRes] = await Promise.all([
           pool.query(`SELECT COUNT(*) AS count FROM "${slug}";`),
           pool.query(
-            `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at
+            `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at, daily_limit
                FROM client_settings WHERE slug = $1;`,
             [slug]
           ),
@@ -642,7 +655,8 @@ app.get('/api/clients', async (_req, res) => {
         const instanceUrl = cfgRes.rows[0]?.instance_url || null;
         const loopStatus = cfgRes.rows[0]?.loop_status || 'idle';
         const lastRunAt = cfgRes.rows[0]?.last_run_at || null;
-        clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt });
+        const dailyLimit = cfgRes.rows[0]?.daily_limit ?? DAILY_MESSAGE_COUNT;
+        clients.push({ slug, queueCount, autoRun, iaAuto, instanceUrl, loopStatus, lastRunAt, dailyLimit });
       } catch (innerErr) {
         console.error('Erro ao contar fila para', slug, innerErr);
         clients.push({ slug });
@@ -728,7 +742,15 @@ app.get('/api/quota', async (req, res) => {
   const slug = req.query.client;
   if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
   try {
-    const cap = DAILY_MESSAGE_COUNT;
+    // cap por cliente
+    let cap = DAILY_MESSAGE_COUNT;
+    try {
+      const r0 = await pool.query(
+        `SELECT COALESCE(daily_limit, $2) AS cap FROM client_settings WHERE slug = $1;`,
+        [slug, DAILY_MESSAGE_COUNT]
+      );
+      if (r0.rows[0]) cap = Number(r0.rows[0].cap) || DAILY_MESSAGE_COUNT;
+    } catch {}
     const r = await pool.query(
       `SELECT COUNT(*)::int AS c
          FROM "${slug}_totais"
@@ -978,6 +1000,7 @@ app.get('/api/client-settings', async (req, res) => {
       instanceAuthScheme: cfg.instance_auth_scheme || '',
       loopStatus: cfg.loop_status || 'idle',
       lastRunAt: cfg.last_run_at || null,
+      dailyLimit: cfg.daily_limit ?? DAILY_MESSAGE_COUNT,
     });
   } catch (err) {
     console.error('Erro ao obter configurações', err);
@@ -985,7 +1008,7 @@ app.get('/api/client-settings', async (req, res) => {
   }
 });
 
-/** Salva configurações do cliente (inclui token/header/scheme) */
+/** Salva configurações do cliente (inclui token/header/scheme e dailyLimit) */
 app.post('/api/client-settings', async (req, res) => {
   const {
     client,
@@ -995,6 +1018,7 @@ app.post('/api/client-settings', async (req, res) => {
     instanceToken,
     instanceAuthHeader,
     instanceAuthScheme,
+    dailyLimit,
   } = req.body || {};
   if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
 
@@ -1011,6 +1035,7 @@ app.post('/api/client-settings', async (req, res) => {
       instanceToken,
       instanceAuthHeader,
       instanceAuthScheme,
+      dailyLimit,
     });
 
     const cfg = await getClientSettings(client);
@@ -1298,6 +1323,8 @@ async function runLoopForClient(clientSlug, opts = {}) {
     } catch {}
 
     const settings = await getClientSettings(clientSlug);
+    const dailyLimit = Number(settings?.daily_limit) > 0 ? Math.floor(Number(settings.daily_limit)) : DAILY_MESSAGE_COUNT;
+
     let processed = 0;
     let manualStop = false;
     const useIA = typeof opts.iaAutoOverride === 'boolean' ? opts.iaAutoOverride : !!settings.ia_auto;
@@ -1312,7 +1339,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
             AND updated_at::date = CURRENT_DATE;`
       );
       alreadySentToday = Number(sentTodayRes.rows?.[0]?.c || 0);
-      console.log(`[${clientSlug}] Enviadas hoje: ${alreadySentToday}/${DAILY_MESSAGE_COUNT}`);
+      console.log(`[${clientSlug}] Enviadas hoje: ${alreadySentToday}/${dailyLimit}`);
     } catch (e) {
       console.warn(`[${clientSlug}] Falha ao contar envios de hoje`, e);
     }
@@ -1321,9 +1348,9 @@ async function runLoopForClient(clientSlug, opts = {}) {
       manualStop = true;
     }
 
-    const remainingToday = Math.max(0, DAILY_MESSAGE_COUNT - alreadySentToday);
+    const remainingToday = Math.max(0, dailyLimit - alreadySentToday);
     if (!manualStop && remainingToday <= 0) {
-      console.log(`[${clientSlug}] Cota diária (${DAILY_MESSAGE_COUNT}) atingida. Encerrando.`);
+      console.log(`[${clientSlug}] Cota diária (${dailyLimit}) atingida. Encerrando.`);
       try {
         snapshotEnd(clientSlug, processed, { reason: 'daily_quota' });
         getEmitter(clientSlug).emit('progress', { type: 'end', processed, at: new Date().toISOString(), reason: 'daily_quota' });
@@ -1332,7 +1359,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
       return { processed, status: 'quota_reached' };
     }
 
-    const scheduleDelays = generateScheduleDelays(DAILY_MESSAGE_COUNT, DAILY_START_TIME, DAILY_END_TIME);
+    const scheduleDelays = generateScheduleDelays(dailyLimit, DAILY_START_TIME, DAILY_END_TIME);
     const messageLimit = Math.min(batchSize, scheduleDelays.length);
 
     const planCount = Math.min(messageLimit, remainingToday);
@@ -1344,7 +1371,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
           acc += scheduleDelays[i];
           planned.push(new Date(Date.now() + acc * 1000).toISOString());
         }
-        getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
+        getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: dailyLimit });
       } catch {}
     }
 
