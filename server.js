@@ -115,8 +115,9 @@ const COMPAT_ENDPOINTS = new Set([
   'delete-client',
   'healthz',
   'quota',
-  /* >>> ADIÇÃO */
+  /* >>> ADIÇÕES */
   'leads',
+  'loop-state', // <—— novo: compat para /api/loop-state
 ]);
 
 app.use((req, _res, next) => {
@@ -522,7 +523,56 @@ async function ensureRegionColumns(slug) {
 /** Healthcheck */
 app.get('/api/healthz', (_req, res) => res.json({ up: true }));
 
-/* ---------- AQUI: NOVA ROTA DE BUSCA (SOMENTE CONSULTA, NÃO SALVA) ---------- */
+/* ---------- NOVA ROTA: Estado do loop / cota de hoje ---------- */
+app.get('/api/loop-state', async (req, res) => {
+  const slug = req.query.client;
+  if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
+
+  try {
+    const cap = DAILY_MESSAGE_COUNT;
+
+    let sent_today = 0;
+    try {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS c
+           FROM "${slug}_totais"
+          WHERE mensagem_enviada = true
+            AND updated_at::date = CURRENT_DATE;`
+      );
+      sent_today = Number(r.rows?.[0]?.c || 0);
+    } catch {}
+
+    let loop_status = 'idle', last_run_at = null;
+    try {
+      const r2 = await pool.query(
+        `SELECT loop_status, last_run_at FROM client_settings WHERE slug = $1;`,
+        [slug]
+      );
+      if (r2.rows[0]) {
+        loop_status = r2.rows[0].loop_status || 'idle';
+        last_run_at = r2.rows[0].last_run_at || null;
+      }
+    } catch {}
+
+    const remaining_today = Math.max(0, cap - sent_today);
+    res.json({
+      cap,
+      sent_today,
+      remaining_today,
+      window_start: DAILY_START_TIME,
+      window_end: DAILY_END_TIME,
+      loop_status,
+      last_run_at,
+      now: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('Erro em /api/loop-state', err);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+/* ---------- FIM: loop-state ---------- */
+
+/* ---------- ROTA DE BUSCA DE LEADS (consulta) ---------- */
 app.get('/api/leads/search', async (req, res) => {
   try {
     // Aceita tanto region/niche/limit quanto local/nicho/n (compat com o outro back)
@@ -1201,17 +1251,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
           acc += scheduleDelays[i];
           planned.push(new Date(Date.now() + acc * 1000).toISOString());
         }
-        // ===== ALTERAÇÃO: salvar + emitir o schedule =====
-        const scheduleEvt = {
-          type: 'schedule',
-          planned,
-          remainingToday,
-          cap: DAILY_MESSAGE_COUNT,
-          at: new Date().toISOString(),
-        };
-        try { snapshotPush(clientSlug, scheduleEvt); } catch {}
-        getEmitter(clientSlug).emit('progress', scheduleEvt);
-        // ===== FIM ALTERAÇÃO =====
+        getEmitter(clientSlug).emit('progress', { type: 'schedule', planned, remainingToday, cap: DAILY_MESSAGE_COUNT });
       } catch {}
     }
 
