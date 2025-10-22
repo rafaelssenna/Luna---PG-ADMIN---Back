@@ -126,7 +126,8 @@ app.use((req, _res, next) => {
 const upload = multer({ storage: multer.memoryStorage() });
 
 function validateSlug(slug) {
-  return /^cliente_[a-z0-9_]+$/.test(slug);
+  // Permite slugs com ou sem o prefixo "cliente_"
+  return /^cliente_[a-z0-9_]+$/.test(slug) || /^[a-z0-9_]+$/.test(slug);
 }
 
 /* ======================  Estado e SSE por cliente  ====================== */
