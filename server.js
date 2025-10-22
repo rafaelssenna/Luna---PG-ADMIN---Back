@@ -36,16 +36,11 @@ function generateScheduleDelays(count, startStr, endStr) {
   const startSec = hmsToSeconds(startStr);
   const endSec = hmsToSeconds(endStr);
 
-  // início efetivo: se já passou do início, começa agora; senão, aguarda até o início
   const effectiveStart = Math.max(nowSec, startSec);
-
-  // se já passou do término, sem tempo para hoje
   if (endSec <= effectiveStart) return [];
-
   const span = endSec - effectiveStart;
   const msgCount = Math.min(count, span);
 
-  // offsets aleatórios e ordenados
   const offsets = new Set();
   while (offsets.size < msgCount) offsets.add(Math.floor(Math.random() * (span + 1)));
   const sortedOffsets = Array.from(offsets).sort((a, b) => a - b);
@@ -87,7 +82,6 @@ app.use((req, res, next) => {
     'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization, token'
   );
-  // res.setHeader('Access-Control-Allow-Credentials', 'true');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -117,7 +111,8 @@ const COMPAT_ENDPOINTS = new Set([
   'quota',
   /* >>> ADIÇÕES */
   'leads',
-  'loop-state', // <—— novo: compat para /api/loop-state
+  'loop-state',
+  'sent-today',           // <— compat para /api/sent-today
 ]);
 
 app.use((req, _res, next) => {
@@ -236,10 +231,6 @@ async function saveClientSettings(
 }
 
 /* ======================  IA (UAZAPI) ====================== */
-/**
- * Normaliza número para E.164 BR como **string** com '+'
- * Ex.: "31999999999" -> "+5531999999999" | "553199..." -> "+553199..."
- */
 function normalizePhoneE164BR(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -257,13 +248,13 @@ function fillTemplate(tpl, vars) {
 
 const UAZ = {
   token: process.env.UAZAPI_TOKEN || '',
-  authHeader: process.env.UAZAPI_AUTH_HEADER || 'token',           // UAZAPI padrão aceita 'token'
-  authScheme: process.env.UAZAPI_AUTH_SCHEME ?? '',                // geralmente vazio
-  phoneField: process.env.UAZAPI_PHONE_FIELD || 'phone',           // DOC: phone
-  textField: process.env.UAZAPI_TEXT_FIELD || 'message',           // DOC: message
+  authHeader: process.env.UAZAPI_AUTH_HEADER || 'token',
+  authScheme: process.env.UAZAPI_AUTH_SCHEME ?? '',
+  phoneField: process.env.UAZAPI_PHONE_FIELD || 'phone',
+  textField: process.env.UAZAPI_TEXT_FIELD || 'message',
   digitsOnly: (process.env.UAZAPI_PHONE_DIGITS_ONLY || 'true') === 'true',
-  payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'json').toLowerCase(), // json|form|query|template|auto
-  methodPref: (process.env.UAZAPI_METHOD || 'post').toLowerCase(),          // post|get|auto
+  payloadStyle: (process.env.UAZAPI_PAYLOAD_STYLE || 'json').toLowerCase(),
+  methodPref: (process.env.UAZAPI_METHOD || 'post').toLowerCase(),
   extra: (() => {
     try { return JSON.parse(process.env.UAZAPI_EXTRA || '{}'); }
     catch { return {}; }
@@ -271,11 +262,6 @@ const UAZ = {
   template: process.env.MESSAGE_TEMPLATE || 'Olá {NAME}, aqui é do {CLIENT}.',
 };
 
-/**
- * Monta a request para UAZAPI de forma segura:
- * - POST → envia JSON { phone, message } no **corpo** (evita "Missing required fields")
- * - GET  → usa querystring (somente para cenários template/query)
- */
 function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const hasTpl = /\{(NUMBER|PHONE_E164|TEXT)\}/.test(instanceUrl);
   const hasQueryParams = /\?[^#]*=/.test(instanceUrl);
@@ -285,7 +271,7 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
   const decideMethod = () => {
     if (methodEnv === 'get') return 'GET';
     if (methodEnv === 'post') return 'POST';
-    return (hasTpl || hasQueryParams) ? 'GET' : 'POST'; // auto
+    return (hasTpl || hasQueryParams) ? 'GET' : 'POST';
   };
 
   const method = decideMethod();
@@ -301,7 +287,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     };
   };
 
-  // 1) URL templateda
   if (style === 'template' || hasTpl) {
     if (method === 'GET') {
       const url = instanceUrl
@@ -310,7 +295,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
         .replace(/\{TEXT\}/g, encodeURIComponent(text));
       return { url, method: 'GET' };
     }
-    // POST com body JSON (limpa query se houver)
     let cleanUrl;
     try { const u = new URL(instanceUrl); cleanUrl = u.origin + u.pathname; }
     catch { cleanUrl = instanceUrl.split('?')[0]; }
@@ -318,7 +302,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
   }
 
-  // 2) URL com query (?a=b). Em POST, alguns gateways ignoram a query → manda JSON no corpo.
   if (style === 'query' || (hasQueryParams && style === 'auto')) {
     const u = new URL(instanceUrl);
     if (method === 'GET') {
@@ -329,13 +312,11 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
       });
       return { url: u.toString(), method: 'GET' };
     }
-    // POST: envia no corpo
     const cleanUrl = u.origin + u.pathname;
     const j = makeJson();
     return { url: cleanUrl, method: 'POST', headers: j.headers, body: j.body };
   }
 
-  // 3) FORM
   if (style === 'form') {
     const form = new URLSearchParams();
     Object.entries(UAZ.extra || {}).forEach(([k, v]) =>
@@ -347,7 +328,6 @@ function buildUazRequest(instanceUrl, { e164, digits, text }) {
     return { url: instanceUrl, method: 'POST', headers, body: form.toString() };
   }
 
-  // 4) JSON (default)
   const j = makeJson();
   return { url: instanceUrl, method: 'POST', headers: j.headers, body: j.body };
 }
@@ -413,7 +393,6 @@ async function runIAForContact({
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
 
-    // Header de autenticação (token, por padrão)
     const hdrName =
       (instanceAuthHeader && instanceAuthHeader.trim()) || UAZ.authHeader || 'token';
     const hdrScheme =
@@ -508,7 +487,6 @@ function mapHeader(headerCells) {
 /* ======================  ADIÇÃO: integração com buscador de leads  ====================== */
 const { searchLeads } = require('./leadsSearcher');
 
-/** Garante que as tabelas do cliente tenham a coluna region (adição não destrutiva) */
 async function ensureRegionColumns(slug) {
   try {
     await pool.query(`ALTER TABLE "${slug}" ADD COLUMN IF NOT EXISTS region TEXT;`);
@@ -575,7 +553,6 @@ app.get('/api/loop-state', async (req, res) => {
 /* ---------- ROTA DE BUSCA DE LEADS (consulta) ---------- */
 app.get('/api/leads/search', async (req, res) => {
   try {
-    // Aceita tanto region/niche/limit quanto local/nicho/n (compat com o outro back)
     const region = req.query.region || req.query.local || req.query.city || '';
     const niche  = req.query.niche  || req.query.nicho || req.query.segment || '';
     const limit  = parseInt(req.query.limit || req.query.n || '0', 10) || undefined;
@@ -588,6 +565,44 @@ app.get('/api/leads/search', async (req, res) => {
   }
 });
 /* ---------- FIM: NOVA ROTA DE BUSCA ---------- */
+
+/** NOVA ROTA: Enviados (hoje) — para pré-carregar no feed */
+app.get('/api/sent-today', async (req, res) => {
+  const slug = req.query.client;
+  if (!slug || !validateSlug(slug)) return res.status(400).json({ error: 'Cliente inválido' });
+
+  const table = `${slug}_totais`;
+  const exists = await tableExists(table);
+  if (!exists) return res.json({ items: [], total: 0 });
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '100', 10) || 100, 1), 500);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+
+  try {
+    const itemsSql = `
+      SELECT name, phone, niche, updated_at
+        FROM "${table}"
+       WHERE mensagem_enviada = true
+         AND updated_at::date = CURRENT_DATE
+       ORDER BY updated_at DESC
+       LIMIT $1 OFFSET $2;`;
+    const itemsRes = await pool.query(itemsSql, [limit, offset]);
+    const items = itemsRes.rows;
+
+    const countSql = `
+      SELECT COUNT(*)::int AS total
+        FROM "${table}"
+       WHERE mensagem_enviada = true
+         AND updated_at::date = CURRENT_DATE;`;
+    const countRes = await pool.query(countSql);
+    const total = Number(countRes.rows?.[0]?.total || 0);
+
+    res.json({ items, total });
+  } catch (err) {
+    console.error('Erro em /api/sent-today', err);
+    res.status(500).json({ error: 'Erro interno ao consultar enviados de hoje' });
+  }
+});
 
 /** Lista clientes (slug e fila) + flags salvas */
 app.get('/api/clients', async (_req, res) => {
@@ -1036,7 +1051,6 @@ async function sleepAbortable(ms, slug) {
   return 'ok';
 }
 
-/** Solicita parada imediata do loop do cliente */
 app.post('/api/stop-loop', async (req, res) => {
   const client = req.body?.client;
   if (!client || !validateSlug(client)) {
@@ -1056,11 +1070,6 @@ app.post('/api/stop-loop', async (req, res) => {
 });
 
 /* ======================  >>> ADIÇÃO: Buscar & salvar LEADS  ====================== */
-/**
- * POST /api/leads
- * Body: { client: 'cliente_x', region?: string, niche?: string, limit?: number }
- * Integra com o Back-Smart-Leads e salva na base do cliente (evita duplicados).
- */
 app.post('/api/leads', async (req, res) => {
   try {
     const { client, region, niche, limit } = req.body || {};
@@ -1070,7 +1079,6 @@ app.post('/api/leads', async (req, res) => {
 
     await ensureRegionColumns(client);
 
-    // Chama a busca (arquivo leadsSearcher.js)
     const raw = await searchLeads({ region, niche, limit });
     const results = Array.isArray(raw) ? raw : [];
 
@@ -1221,7 +1229,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
       console.warn(`[${clientSlug}] Falha ao contar envios de hoje`, e);
     }
 
-    // Se já pediram parada antes de começar, respeita
     if (stopRequests.has(clientSlug)) {
       manualStop = true;
     }
@@ -1237,11 +1244,9 @@ async function runLoopForClient(clientSlug, opts = {}) {
       return { processed, status: 'quota_reached' };
     }
 
-    // Gera grade de delays
     const scheduleDelays = generateScheduleDelays(DAILY_MESSAGE_COUNT, DAILY_START_TIME, DAILY_END_TIME);
     const messageLimit = Math.min(batchSize, scheduleDelays.length);
 
-    // Anuncia grade planejada
     const planCount = Math.min(messageLimit, remainingToday);
     if (!manualStop) {
       try {
@@ -1276,7 +1281,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
       if (stopRequests.has(clientSlug)) { manualStop = true; break; }
 
-      // Seleciona próximo contato, ignorando os já tentados nesse ciclo
       let whereNotIn = '';
       let params = [];
       if (attemptedPhones.size) {
@@ -1355,7 +1359,6 @@ async function runLoopForClient(clientSlug, opts = {}) {
       if (manualStop) break;
     }
 
-    // Ao final, atualiza status
     await pool.query(
       `INSERT INTO client_settings (slug, loop_status, last_run_at)
        VALUES ($1, 'idle', NOW())
