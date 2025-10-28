@@ -1495,6 +1495,73 @@ scheduleDailyAutoRun();
 
 /* =====================  Supervisão de Conversas (UAZAPI)  ===================== */
 
+// Helper para extrair o systemName do endpoint salvo
+function systemNameFromInstanceUrl(u) {
+  try {
+    const host = new URL(u).hostname || "";
+    return (host.split(".")[0] || "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+// Resolve a instância correta do cliente (prioriza token, depois systemName)
+app.get('/api/instances/resolve', async (req, res) => {
+  try {
+    const slug = req.query.client;
+    if (!slug || !validateSlug(slug)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
+    }
+
+    const cfg = await getClientSettings(slug);
+    const wantToken = (cfg?.instance_token || "").trim();
+    const wantSys   = systemNameFromInstanceUrl(cfg?.instance_url || "");
+
+    await refreshInstances(true);
+    const all = Array.from(instanceCache.values()) || [];
+
+    // 1) match por token
+    if (wantToken) {
+      const byToken = all.find((it) => {
+        const tok = it?.token || it?.instanceToken || it?.key || "";
+        return tok && String(tok).trim() === wantToken;
+      });
+      if (byToken) {
+        return res.json({
+          id: byToken.id || byToken._id || byToken.instanceId,
+          name: byToken.name || byToken.systemName || '',
+          systemName: byToken.systemName || '',
+          matchedBy: 'token'
+        });
+      }
+    }
+
+    // 2) match por systemName
+    if (wantSys) {
+      const want = wantSys.toLowerCase();
+      const bySys = all.find((it) => String(it?.systemName || '').toLowerCase() === want)
+                 || all.find((it) => String(it?.name || '').toLowerCase().includes(want));
+      if (bySys) {
+        return res.json({
+          id: bySys.id || bySys._id || bySys.instanceId,
+          name: bySys.name || bySys.systemName || '',
+          systemName: bySys.systemName || '',
+          matchedBy: 'system'
+        });
+      }
+    }
+
+    return res.status(404).json({
+      error: 'Nenhuma instância compatível com a configuração do cliente',
+      wantSystem: wantSys || null,
+      matchedBy: null
+    });
+  } catch (e) {
+    console.error('instances/resolve error', e);
+    return res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
 // Lista instâncias
 app.get('/api/instances', async (_req, res) => {
   try {
