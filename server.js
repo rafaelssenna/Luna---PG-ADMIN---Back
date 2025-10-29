@@ -342,8 +342,9 @@ function normalizePhoneE164BR(phone) {
   return `+${digits}`;
 }
 
+// >>>> ACEITA {NICHO}/{NICHE}
 function fillTemplate(tpl, vars) {
-  return String(tpl || '').replace(/\{(NAME|CLIENT|PHONE)\}/gi, (_, k) => {
+  return String(tpl || '').replace(/\{(NAME|CLIENT|PHONE|NICHO|NICHE)\}/gi, (_, k) => {
     const key = k.toUpperCase();
     return vars[key] ?? '';
   });
@@ -467,8 +468,15 @@ async function httpSend({ url, method, headers, body }) {
   });
 }
 
+// normaliza exibição do nicho (ex.: "DESENVOLVIMENTO DE SISTEMAS" -> "Desenvolvimento De Sistemas")
+function normalizeNiche(n) {
+  if (!n) return '';
+  const s = String(n).trim();
+  return s.toLowerCase().replace(/\b\p{L}/gu, c => c.toUpperCase());
+}
+
 async function runIAForContact({
-  client, name, phone,
+  client, name, phone, niche, // <<<<< niche incluído
   instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme,
 }) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
@@ -477,7 +485,14 @@ async function runIAForContact({
   try {
     const e164   = normalizePhoneE164BR(phone);
     const digits = String(e164).replace(/\D/g, '');
-    const text   = fillTemplate(UAZ.template, { NAME: name, CLIENT: client, PHONE: e164 });
+    const prettyNiche = normalizeNiche(niche);
+    const text   = fillTemplate(UAZ.template, {
+      NAME: name,
+      CLIENT: client,
+      PHONE: e164,
+      NICHO: prettyNiche,
+      NICHE: prettyNiche,
+    });
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
 
@@ -1390,10 +1405,25 @@ async function runLoopForClient(clientSlug, opts = {}) {
         params = arr;
       }
 
-      const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
-      if (next.rows.length === 0) break;
+      // Tenta buscar name, phone, niche da fila; se a coluna 'niche' não existir, cai no fallback.
+      let name, phone, niche;
+      try {
+        const next = await pool.query(`SELECT name, phone, niche FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
+        if (!next.rows.length) break;
+        ({ name, phone, niche } = next.rows[0]);
+      } catch {
+        const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
+        if (!next.rows.length) break;
+        ({ name, phone } = next.rows[0]);
+        try {
+          const rN = await pool.query(
+            `SELECT niche FROM "${clientSlug}_totais" WHERE phone = $1 ORDER BY updated_at DESC LIMIT 1;`,
+            [phone]
+          );
+          niche = rN.rows?.[0]?.niche || null;
+        } catch { niche = null; }
+      }
 
-      const { name, phone } = next.rows[0];
       attemptedPhones.add(phone);
 
       let sendRes = null;
@@ -1403,7 +1433,7 @@ async function runLoopForClient(clientSlug, opts = {}) {
       if (!manualStop) {
         if (useIA) {
           sendRes   = await runIAForContact({
-            client: clientSlug, name, phone,
+            client: clientSlug, name, phone, niche, // <<<<< niche passa para o envio
             instanceUrl: settings.instance_url,
             instanceToken: settings.instance_token,
             instanceAuthHeader: settings.instance_auth_header,
