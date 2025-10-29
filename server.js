@@ -615,6 +615,17 @@ app.get('/api/loop-state', async (req, res) => {
       }
     } catch {}
 
+    // <<< NOVO: verdade de fato (memória do processo) >>>
+    const isActuallyRunning = runningClients.has(slug);
+
+    // Auto-heal: se o DB diz "running" mas nada está rodando, normaliza para "idle"
+    if (!isActuallyRunning && loop_status === 'running') {
+      loop_status = 'idle';
+      try {
+        await pool.query(`UPDATE client_settings SET loop_status='idle' WHERE slug=$1`, [slug]);
+      } catch {}
+    }
+
     let sent_today = 0;
     try {
       const r = await pool.query(
@@ -627,13 +638,15 @@ app.get('/api/loop-state', async (req, res) => {
     } catch {}
 
     const remaining_today = Math.max(0, cap - sent_today);
+
     res.json({
       cap,
       sent_today,
       remaining_today,
       window_start: DAILY_START_TIME,
       window_end: DAILY_END_TIME,
-      loop_status,
+      loop_status,                      // já normalizado
+      actually_running: isActuallyRunning, // <<< NOVO: front pode usar
       last_run_at,
       now: new Date().toISOString(),
     });
@@ -642,6 +655,7 @@ app.get('/api/loop-state', async (req, res) => {
     res.status(500).json({ error: 'Erro interno' });
   }
 });
+
 
 // Busca de leads (consulta)
 app.get('/api/leads/search', async (req, res) => {
