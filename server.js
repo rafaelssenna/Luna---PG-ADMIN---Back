@@ -261,7 +261,8 @@ CREATE TABLE IF NOT EXISTS client_settings (
   instance_auth_scheme TEXT,
   loop_status TEXT DEFAULT 'idle',
   last_run_at TIMESTAMPTZ,
-  daily_limit INTEGER DEFAULT 30
+  daily_limit INTEGER DEFAULT 30,
+  message_template TEXT
 );
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_token TEXT;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_header TEXT;
@@ -269,8 +270,10 @@ ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS instance_auth_scheme TEXT;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS loop_status TEXT DEFAULT 'idle';
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ;
 ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 30;
+ALTER TABLE client_settings ADD COLUMN IF NOT EXISTS message_template TEXT;
 `);
 }
+
 ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
 
 async function getClientSettings(slug) {
