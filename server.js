@@ -280,7 +280,7 @@ async function getClientSettings(slug) {
   const { rows } = await pool.query(
     `SELECT auto_run, ia_auto, instance_url, loop_status, last_run_at,
             instance_token, instance_auth_header, instance_auth_scheme,
-            daily_limit
+            daily_limit, message_template
        FROM client_settings
       WHERE slug = $1`,
     [slug]
@@ -296,14 +296,20 @@ async function getClientSettings(slug) {
       loop_status: 'idle',
       last_run_at: null,
       daily_limit: null,
+      message_template: null,
     };
   }
   return rows[0];
 }
 
+
 async function saveClientSettings(
   slug,
-  { autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme, dailyLimit }
+  {
+    autoRun, iaAuto, instanceUrl, instanceToken,
+    instanceAuthHeader, instanceAuthScheme, dailyLimit,
+    messageTemplate, // << novo
+  }
 ) {
   const safeDaily =
     Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) > 0
@@ -312,8 +318,8 @@ async function saveClientSettings(
 
   await pool.query(
     `INSERT INTO client_settings
-       (slug, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, daily_limit)
-     VALUES ($1,   $2,       $3,     $4,           $5,             $6,                   $7,             $8)
+       (slug, auto_run, ia_auto, instance_url, instance_token, instance_auth_header, instance_auth_scheme, daily_limit, message_template)
+     VALUES ($1,   $2,       $3,     $4,           $5,             $6,                   $7,             $8,           $9)
      ON CONFLICT (slug)
      DO UPDATE SET
        auto_run = EXCLUDED.auto_run,
@@ -322,7 +328,8 @@ async function saveClientSettings(
        instance_token = EXCLUDED.instance_token,
        instance_auth_header = EXCLUDED.instance_auth_header,
        instance_auth_scheme = EXCLUDED.instance_auth_scheme,
-       daily_limit = COALESCE(EXCLUDED.daily_limit, client_settings.daily_limit)`,
+       daily_limit = COALESCE(EXCLUDED.daily_limit, client_settings.daily_limit),
+       message_template = EXCLUDED.message_template`,
     [
       slug,
       !!autoRun,
@@ -332,6 +339,7 @@ async function saveClientSettings(
       instanceAuthHeader || 'token',
       instanceAuthScheme ?? '',
       safeDaily,
+      messageTemplate ?? null,
     ]
   );
 }
@@ -347,9 +355,12 @@ function normalizePhoneE164BR(phone) {
 
 // >>>> ACEITA {NICHO}/{NICHE}
 function fillTemplate(tpl, vars) {
-  return String(tpl || '').replace(/\{(NAME|CLIENT|PHONE|NICHO|NICHE)\}/gi, (_, k) => {
+  // Suporta {NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE} (case-insensitive)
+  return String(tpl || '').replace(/\{(NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE)\}/gi, (_, k) => {
     const key = k.toUpperCase();
-    return vars[key] ?? '';
+    const map = { NOME: 'NAME', CLIENTE: 'CLIENT', TELEFONE: 'PHONE', NICHE: 'NICHO' };
+    const finalKey = map[key] || key;
+    return vars[finalKey] ?? '';
   });
 }
 
@@ -479,22 +490,28 @@ function normalizeNiche(n) {
 }
 
 async function runIAForContact({
-  client, name, phone, niche, // <<<<< niche incluído
+  client, name, phone, niche,
   instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme,
+  messageTemplate, // << novo
 }) {
   const SHOULD_CALL = process.env.IA_CALL === 'true';
   if (!SHOULD_CALL || !instanceUrl) return { ok: true, simulated: true };
 
   try {
-    const e164   = normalizePhoneE164BR(phone);
+    const e164 = normalizePhoneE164BR(phone);
     const digits = String(e164).replace(/\D/g, '');
     const prettyNiche = normalizeNiche(niche);
-    const text   = fillTemplate(UAZ.template, {
+
+    // Pega o template do cliente ou cai no global (.env)
+    const tpl = (typeof messageTemplate === 'string' && messageTemplate.trim())
+      ? messageTemplate
+      : UAZ.template;
+
+    const text = fillTemplate(tpl, {
       NAME: name,
       CLIENT: client,
       PHONE: e164,
       NICHO: prettyNiche,
-      NICHE: prettyNiche,
     });
 
     const req = buildUazRequest(instanceUrl, { e164, digits, text });
@@ -1072,15 +1089,16 @@ app.get('/api/client-settings', async (req, res) => {
   try {
     const cfg = await getClientSettings(slug);
     res.json({
-      autoRun:          !!cfg.auto_run,
-      iaAuto:           !!cfg.ia_auto,
-      instanceUrl:       cfg.instance_url || null,
-      instanceToken:     cfg.instance_token || '',
-      instanceAuthHeader:cfg.instance_auth_header || 'token',
-      instanceAuthScheme:cfg.instance_auth_scheme || '',
-      loopStatus:        cfg.loop_status || 'idle',
-      lastRunAt:         cfg.last_run_at || null,
-      dailyLimit:        cfg.daily_limit ?? DAILY_MESSAGE_COUNT,
+      autoRun:           !!cfg.auto_run,
+      iaAuto:            !!cfg.ia_auto,
+      instanceUrl:        cfg.instance_url || null,
+      instanceToken:      cfg.instance_token || '',
+      instanceAuthHeader: cfg.instance_auth_header || 'token',
+      instanceAuthScheme: cfg.instance_auth_scheme || '',
+      loopStatus:         cfg.loop_status || 'idle',
+      lastRunAt:          cfg.last_run_at || null,
+      dailyLimit:         cfg.daily_limit ?? DAILY_MESSAGE_COUNT,
+      messageTemplate:    cfg.message_template || '',   // << novo
     });
   } catch (err) {
     console.error('Erro ao obter configurações', err);
@@ -1094,6 +1112,7 @@ app.post('/api/client-settings', async (req, res) => {
     client, autoRun, iaAuto,
     instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme,
     dailyLimit,
+    messageTemplate, // << novo
   } = req.body || {};
   if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
 
@@ -1105,6 +1124,7 @@ app.post('/api/client-settings', async (req, res) => {
 
     await saveClientSettings(client, {
       autoRun, iaAuto, instanceUrl, instanceToken, instanceAuthHeader, instanceAuthScheme, dailyLimit,
+      messageTemplate: typeof messageTemplate === 'string' ? messageTemplate : null,
     });
 
     const cfg = await getClientSettings(client);
@@ -1114,6 +1134,7 @@ app.post('/api/client-settings', async (req, res) => {
     res.status(500).json({ error: 'Erro interno ao salvar configurações' });
   }
 });
+
 
 // Apagar cliente completo
 app.delete('/api/delete-client', async (req, res) => {
@@ -1449,13 +1470,15 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
       if (!manualStop) {
         if (useIA) {
-          sendRes   = await runIAForContact({
-            client: clientSlug, name, phone, niche, // <<<<< niche passa para o envio
+          sendRes = await runIAForContact({
+            client: clientSlug, name, phone, niche,
             instanceUrl: settings.instance_url,
             instanceToken: settings.instance_token,
             instanceAuthHeader: settings.instance_auth_header,
             instanceAuthScheme: settings.instance_auth_scheme,
+            messageTemplate: settings.message_template || null, // << novo
           });
+
           status    = sendRes && sendRes.ok ? 'success' : 'error';
           shouldMark = status === 'success';
         } else {
