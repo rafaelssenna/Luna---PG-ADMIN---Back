@@ -57,12 +57,33 @@ function normalizePhoneE164BR(phone) {
  * @returns {string}
  */
 function fillTemplate(tpl, vars) {
-  return String(tpl || '').replace(/\{(NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE)\}/gi, (_, k) => {
-    const key = k.toUpperCase();
-    const map = { NOME: 'NAME', CLIENTE: 'CLIENT', TELEFONE: 'PHONE', NICHE: 'NICHO' };
-    const finalKey = map[key] || key;
-    return vars[finalKey] ?? '';
-  });
+  // Gera saudação automática conforme horário atual
+  const now = new Date();
+  const hour = now.getHours();
+  let saudacao;
+  if (hour >= 5 && hour < 12) saudacao = "Bom dia ";
+  else if (hour >= 12 && hour < 18) saudacao = "Boa tarde ";
+  else saudacao = "Boa noite ";
+
+  // Adiciona ao mapa de variáveis
+  vars = { ...vars, SAUDACAO: saudacao };
+
+  // Substitui campos do template por variáveis fornecidas
+  return String(tpl || "").replace(
+    /\{(NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE|SAUDACAO|GREETING)\}/gi,
+    (_, k) => {
+      const key = k.toUpperCase();
+      const map = {
+        NOME: "NAME",
+        CLIENTE: "CLIENT",
+        TELEFONE: "PHONE",
+        NICHE: "NICHO",
+        GREETING: "SAUDACAO",
+      };
+      const finalKey = map[key] || key;
+      return vars[finalKey] ?? "";
+    }
+  );
 }
 
 /**
