@@ -2093,7 +2093,7 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
           ],
-          max_tokens: ANALYSIS_OUTPUT_BUDGET,
+          max_completion_tokens: ANALYSIS_OUTPUT_BUDGET,
           temperature: 0.5,
           n: 1,
         };
