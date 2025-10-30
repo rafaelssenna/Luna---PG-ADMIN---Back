@@ -2094,7 +2094,7 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
             { role: 'user', content },
           ],
           max_completion_tokens: ANALYSIS_OUTPUT_BUDGET,
-          temperature: 0.5,
+          temperature: 1,
           n: 1,
         };
         try {
