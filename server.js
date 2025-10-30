@@ -1766,18 +1766,20 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
           // Loga a resposta bruta (encurtada) para depuração
           const rawSnippet = text ? text.slice(0, 120).replace(/\n/g, ' ') + (text.length > 120 ? '…' : '') : '(resposta vazia)';
           appendLog(`📦 Retorno do lote ${i + 1}: ${rawSnippet}`);
-          if (text) {
-            results.push(`### Lote ${i + 1}\n${text.trim()}`);
+        if (text) {
+            // Adiciona apenas o texto das sugestões, sem cabeçalhos por lote.
+            results.push(text.trim());
             appendLog(`✅ Lote ${i + 1} concluído (tamanho aprox. chunk: ${chunks[i].length} chars).`);
-          } else {
+        } else {
             appendLog(`⚠️ Lote ${i + 1} retornou texto vazio.`);
-          }
+        }
         } catch (err) {
           const msgErr = err.response?.data?.error?.message || err.message || err.toString();
           console.error('Erro ao chamar OpenAI', msgErr);
           appendLog(`❌ Falha no lote ${i + 1}: ${msgErr}`);
         }
       }
+      // Concatena os resultados com separadores simples. Remove cabeçalhos desnecessários.
       suggestions = results.join('\n\n---\n\n');
       if (!suggestions) {
         infoMessage = 'Sem sugestões geradas (modelo pode ter retornado vazio).';
@@ -1831,7 +1833,14 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
     const elapsed = Date.now() - startTime;
     appendLog(`🏁 Fim da análise — ${chunks.length} lotes, tempo total ${elapsed}ms`);
 
-    return res.json({ ok: true, suggestions, info: infoMessage });
+    // === Geração do PDF de sugestões ===
+    // Utiliza o texto das sugestões (ou mensagem padrão) para criar um PDF e devolvê-lo como download.
+    const pdfText = suggestions || 'Nenhuma sugestão gerada.';
+    const finalPdfBuffer = generatePdfBuffer(pdfText);
+    // Configura cabeçalhos para download de PDF
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${slug}.pdf"`);
+    return res.end(finalPdfBuffer);
     // ==================== Fim da nova lógica de análise ====================
   } catch (err) {
     console.error('Erro em export-analysis', err);
