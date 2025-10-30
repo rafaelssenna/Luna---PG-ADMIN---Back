@@ -141,6 +141,58 @@ const DEFAULT_SYSTEM_PROMPT =
   'Forneça exemplos de frases prontas e bullets acionáveis. Se houver poucas mensagens, adapte a análise.';
 const SYSTEM_PROMPT_OVERRIDE = process.env.OPENAI_SYSTEM_PROMPT || '';
 
+// === Helper para gerar PDF simples com o texto das sugestões ===
+// Gera um Buffer contendo um PDF A4 com o texto fornecido. Não usa dependências externas.
+function escapePdfString(str) {
+  return String(str)
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+function generatePdfBuffer(text) {
+  // Divide o texto em linhas e prepara comandos de texto em PDF
+  const lines = String(text || '').split(/\r?\n/);
+  let y = 750;
+  let textCommands = '';
+  for (const line of lines) {
+    const escaped = escapePdfString(line);
+    textCommands += `BT 50 ${y} Td (${escaped}) Tj ET\n`;
+    y -= 14;
+    if (y < 50) { // não cabe mais na página; quebra e reinicia Y (não cria outra página neste simples gerador)
+      break;
+    }
+  }
+  const contentStream = `/F1 12 Tf\n` + textCommands;
+  const streamLength = Buffer.byteLength(contentStream, 'latin1');
+  // Monta os objetos do PDF
+  const obj1 = '1 0 obj<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+  const obj2 = '2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
+  const obj3 = '3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n';
+  const obj4 = '4 0 obj<< /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica >>\nendobj\n';
+  const obj5 = `5 0 obj<< /Length ${streamLength} >>\nstream\n${contentStream}\nendstream\nendobj\n`;
+  // Calcula offsets
+  const header = '%PDF-1.4\n';
+  let xrefPos = header.length;
+  const offsets = [0];
+  const objects = [obj1, obj2, obj3, obj4, obj5];
+  let pos = header.length;
+  for (const obj of objects) {
+    offsets.push(pos);
+    pos += Buffer.byteLength(obj, 'latin1');
+  }
+  xrefPos = pos;
+  // Constrói xref
+  let xref = 'xref\n0 6\n0000000000 65535 f \n';
+  for (const off of offsets.slice(1)) {
+    const padded = String(off).padStart(10, '0');
+    xref += `${padded} 00000 n \n`;
+  }
+  const trailer = `trailer<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`;
+  const pdfString = header + obj1 + obj2 + obj3 + obj4 + obj5 + xref + trailer;
+  return Buffer.from(pdfString, 'latin1');
+}
+
 // Logger para registrar execuções de análise
 const { appendLog } = require('./utils/logger');
 
@@ -2201,6 +2253,241 @@ app.post('/api/instances/:id/interactive/reply', async (req, res) => {
     return res.status(202).json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * GET /api/instances/:id/export-analysis.pdf
+ *
+ * Gera um relatório em PDF contendo apenas as sugestões da IA para as conversas recentes.
+ * Diferentemente de `/export-analysis`, esta rota devolve um arquivo PDF pronto para
+ * download com o texto das sugestões em vez de retornar JSON. O conteúdo do PDF
+ * não inclui a transcrição das conversas, apenas as recomendações geradas pelo modelo.
+ *
+ * Requer as mesmas variáveis de ambiente que a rota `/export-analysis`:
+ *  - OPENAI_API_KEY: chave da API da OpenAI
+ *  - OPENAI_MODEL: nome do modelo (ex.: gpt-3.5-turbo ou gpt-5-mini)
+ *  - OPENAI_SYSTEM_PROMPT (opcional): substitui o prompt padrão do papel system
+ *  - OPENAI_TEMPERATURE (opcional): define a temperatura para modelos clássicos
+ *  - OPENAI_REASONING_EFFORT (opcional): define o esforço de raciocínio para modelos de raciocínio (low, medium, high)
+ *  - OPENAI_OUTPUT_BUDGET (opcional): máximo de tokens de saída por solicitação
+ *
+ * Parâmetros de consulta:
+ *  - client: slug do cliente (obrigatório)
+ */
+app.get('/api/instances/:id/export-analysis.pdf', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Slug do cliente via querystring
+    const slug = (req.query?.client || '').toString();
+    if (!slug || !validateSlug(slug)) {
+      return res.status(400).json({ error: 'Cliente inválido' });
+    }
+
+    // Loga início do relatório em PDF
+    console.log(`[export-analysis.pdf] Início — client=${slug}, instance=${id}`);
+
+    // Checa se a chave da OpenAI está configurada
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const analysisEnabled = !!openaiKey;
+
+    // Busca timestamp da última análise para esse cliente
+    let lastTs = null;
+    try {
+      const r = await pool.query(
+        `SELECT analysis_last_msg_ts FROM client_settings WHERE slug = $1`,
+        [slug]
+      );
+      lastTs = r.rows?.[0]?.analysis_last_msg_ts || null;
+    } catch {}
+    console.log(`[export-analysis.pdf] client=${slug} lastTs=${lastTs}`);
+
+    // Resolve a instância UAZAPI e obtém token
+    await refreshInstances(false);
+    const token = resolveInstanceToken(id);
+    if (!token) {
+      return res.status(404).json({ error: 'Instância não encontrada ou sem token' });
+    }
+    console.log(`[export-analysis.pdf] Token resolvido para ${id}: ${token ? 'OK' : 'NULO'}`);
+
+    // Coleta mensagens recentes de no máximo ANALYSIS_MAX_CHATS conversas
+    // e até ANALYSIS_PER_CHAT_LIMIT mensagens por conversa, filtrando pelo timestamp
+    const pageSize = 100;
+    let offsetChats = 0;
+    const chats = [];
+    for (;;) {
+      const data = await uaz.findChats(token, { limit: pageSize, offset: offsetChats });
+      const page = pickArrayList(data);
+      if (!page.length) break;
+      chats.push(...page);
+      if (page.length < pageSize) break;
+      offsetChats += pageSize;
+    }
+    // Ordena chats pela última atividade
+    const chatLastTs = (c) =>
+      c?.wa_lastTimestamp || c?.lastMessageTimestamp || c?.updatedAt || c?.createdAt || 0;
+    chats.sort((a, b) => Number(chatLastTs(b)) - Number(chatLastTs(a)));
+    const selectedChats = chats.slice(0, ANALYSIS_MAX_CHATS);
+
+    // Coleta mensagens novas
+    let allMessages = [];
+    let maxTs = lastTs ? new Date(lastTs).getTime() : 0;
+    for (const chat of selectedChats) {
+      const chatId = extractChatId(chat);
+      if (!chatId) continue;
+      const data = await uaz.findMessages(token, {
+        chatid: chatId,
+        limit: ANALYSIS_PER_CHAT_LIMIT,
+        offset: 0,
+      });
+      const msgs = pickArrayList(data);
+      msgs.sort((a, b) => {
+        const ta =
+          a?.messageTimestamp ||
+          a?.timestamp ||
+          a?.wa_timestamp ||
+          a?.createdAt ||
+          a?.date || 0;
+        const tb =
+          b?.messageTimestamp ||
+          b?.timestamp ||
+          b?.wa_timestamp ||
+          b?.createdAt ||
+          b?.date || 0;
+        return Number(ta) - Number(tb);
+      });
+      for (const msg of msgs) {
+        // extrai timestamp
+        const rawTs =
+          msg?.messageTimestamp ||
+          msg?.timestamp ||
+          msg?.wa_timestamp ||
+          msg?.createdAt ||
+          msg?.date || null;
+        let numTs = null;
+        if (rawTs) {
+          if (typeof rawTs === 'string' && /^\d+$/.test(rawTs)) {
+            const n = Number(rawTs);
+            numTs = n < 10 ** 12 ? n * 1000 : n;
+          } else {
+            const n = Number(rawTs);
+            if (Number.isFinite(n)) {
+              numTs = n < 10 ** 12 ? n * 1000 : n;
+            } else {
+              const d = new Date(rawTs);
+              const ms = d.getTime();
+              numTs = Number.isNaN(ms) ? null : ms;
+            }
+          }
+        }
+        if (numTs == null) continue;
+        // filtra mensagens já analisadas
+        if (lastTs && numTs <= new Date(lastTs).getTime()) {
+          continue;
+        }
+        allMessages.push({ timestamp: numTs, msg });
+        if (numTs > maxTs) maxTs = numTs;
+      }
+    }
+    if (!allMessages.length) {
+      console.log(`[export-analysis.pdf] Nenhuma nova mensagem encontrada para ${slug}`);
+      // Ainda assim, gera um PDF vazio ou com mensagem padrão
+      const emptyBuffer = generatePdfBuffer('Nenhuma mensagem nova para analisar.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="report-${id}-${slug}.pdf"`);
+      return res.end(emptyBuffer);
+    }
+    // Ordena por timestamp asc
+    allMessages.sort((a, b) => a.timestamp - b.timestamp);
+    // Converte mensagens em linhas de transcrição
+    const lines = allMessages.map(({ msg }) => toTranscriptLine(msg)).filter(Boolean);
+
+    // Monta prompts
+    const systemPrompt = SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT;
+    const userIntro = `A seguir está a transcrição (resumida) de ${lines.length} mensagens recentes do cliente ${slug}. Analise o conteúdo e proponha melhorias.`;
+    const baseTokens = approxTokens(systemPrompt) + approxTokens(userIntro) + 50;
+    // Chunking
+    const chunks = [];
+    let current = [];
+    let currentTokens = baseTokens;
+    for (const line of lines) {
+      const t = approxTokens(line) + 1;
+      if (current.length && currentTokens + t > ANALYSIS_INPUT_BUDGET) {
+        chunks.push(current.join('\n'));
+        current = [line];
+        currentTokens = baseTokens + approxTokens(line);
+      } else {
+        current.push(line);
+        currentTokens += t;
+      }
+    }
+    if (current.length) {
+      chunks.push(current.join('\n'));
+    }
+
+    // Coleta sugestões
+    let suggestions = '';
+    if (analysisEnabled) {
+      const results = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const content = `${userIntro}\n\n${chunks[i]}`;
+        const payload = {
+          model: ANALYSIS_MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content },
+          ],
+          n: 1,
+        };
+        const lowerModel = String(ANALYSIS_MODEL || '').toLowerCase();
+        const isReasoningModel = /gpt-5|gpt-4o|\bo[123]\b|\bomni/i.test(lowerModel);
+        if (isReasoningModel) {
+          payload.max_completion_tokens = ANALYSIS_OUTPUT_BUDGET;
+          payload.response_format = { type: 'text' };
+          payload.reasoning_effort = process.env.OPENAI_REASONING_EFFORT || 'low';
+        } else {
+          payload.max_tokens = ANALYSIS_OUTPUT_BUDGET;
+          const tempEnv = process.env.OPENAI_TEMPERATURE;
+          const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : 0.5;
+          if (!Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
+        }
+        try {
+          const response = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
+            headers: {
+              Authorization: `Bearer ${openaiKey}`,
+              'Content-Type': 'application/json',
+            },
+            timeout: 45000,
+          });
+          const text = response?.data?.choices?.[0]?.message?.content || '';
+          if (text) {
+            results.push(text.trim());
+          }
+        } catch (err) {
+          const msgErr = err.response?.data?.error?.message || err.message || err.toString();
+          console.error('Erro ao chamar OpenAI para export-analysis.pdf', msgErr);
+        }
+      }
+      suggestions = results.join('\n\n---\n\n');
+    }
+    // Atualiza last analysis timestamp
+    try {
+      await pool.query(
+        `UPDATE client_settings SET analysis_last_msg_ts = $2 WHERE slug = $1`,
+        [slug, new Date(maxTs).toISOString()]
+      );
+    } catch (e) {
+      console.error('Erro ao atualizar analysis_last_msg_ts em export-analysis.pdf', slug, e);
+    }
+    // Caso não haja sugestões, gera PDF com mensagem padrão
+    const pdfText = suggestions || 'Nenhuma sugestão gerada.';
+    const pdfBuffer = generatePdfBuffer(pdfText);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="report-${id}-${slug}.pdf"`);
+    return res.end(pdfBuffer);
+  } catch (err) {
+    console.error('Erro em export-analysis.pdf', err);
+    return res.status(500).json({ error: String(err.message || err) });
   }
 });
 
