@@ -8,6 +8,7 @@ const { Pool } = require('pg');
 const EventEmitter = require('events');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 const axios = require('axios');
 
 const app = express();
@@ -1796,6 +1797,32 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
     } catch (e) {
       console.error('Erro ao atualizar analysis_last_msg_ts', slug, e);
       appendLog(`⚠️ Falha ao atualizar analysis_last_msg_ts para ${slug}: ${e.message || e}`);
+    }
+
+    // 6.5) Opcional: grava o conteúdo das sugestões em um arquivo para posterior consulta.
+    // Ao salvar o relatório no disco, facilita a visualização fora da API e mantém um
+    // histórico das análises. O arquivo será criado em analysis_reports/ com nome
+    // baseado no slug do cliente e na data/hora atual. Caso a pasta não exista,
+    // ela será criada.
+    try {
+      const reportDir = path.join(__dirname, 'analysis_reports');
+      fs.mkdirSync(reportDir, { recursive: true });
+      const safeSlug = slug.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const reportPath = path.join(reportDir, `${safeSlug}-${timestamp}.txt`);
+      // Concatena sugestões ou informa caso esteja vazio
+      const reportContent = suggestions || 'Nenhuma sugestão gerada.';
+      fs.writeFileSync(reportPath, reportContent, 'utf8');
+      // Anexa informação ao campo info para retorno ao frontend
+      const infoAdd = `Relatório salvo em ${reportPath}`;
+      if (infoMessage) {
+        infoMessage += infoAdd.startsWith(' ') ? infoAdd : ' ' + infoAdd;
+      } else {
+        infoMessage = infoAdd;
+      }
+    } catch (e) {
+      console.error('Erro ao salvar relatório de análise', e);
+      appendLog(`⚠️ Erro ao salvar relatório de análise: ${e.message || e}`);
     }
 
     // Loga fim da análise
