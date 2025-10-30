@@ -12,10 +12,16 @@ require('dotenv').config();
 
 const { Pool } = require('pg');
 const multer = require('multer');
-const { buildClient } = require('./services/uazapi');
-const helpers = require('./utils/helpers');
-const { searchLeads } = require('./services/leadsSearcher');
-const { appendLog } = require('./utils/logger');
+// Importações de módulos externos ao diretório src.
+// Como este arquivo reside em src/, precisamos voltar um nível para acessar
+// os módulos localizados na raiz do projeto (services e utils). Usar paths
+// relativos baseados em './' (que aponta para src/) resultava em erros de
+// resolução e causava falhas em tempo de execução. O correto é '../' para
+// alcançar a raiz do projeto.
+const { buildClient } = require('../services/uazapi');
+const helpers = require('../utils/helpers');
+const { searchLeads } = require('../services/leadsSearcher');
+const { appendLog } = require('../utils/logger');
 
 // ========= Conexão com o banco de dados =========
 // Define um pool global para reutilizar conexões com o PostgreSQL. A configuração
