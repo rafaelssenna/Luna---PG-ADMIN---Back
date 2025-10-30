@@ -1546,47 +1546,51 @@ app.get('/api/instances/:id/export.txt', async (req, res) => {
 app.post('/api/instances/:id/export-analysis', async (req, res) => {
   try {
     const { id } = req.params;
-    // Aceita slug via query ou body
     const slug = (req.query?.client || req.body?.client || '').toString();
-    if (!slug || !validateSlug(slug)) {
-      return res.status(400).json({ error: 'Cliente inválido' });
-    }
-    // Log básico do início da análise para diagnosticar entradas
-    console.log(`[export-analysis] Início — client=${slug}, instance=${id}`);
 
-    // Garante que existe uma chave da OpenAI configurada
+    if (!slug || !validateSlug(slug)) {
+      const pdf = generatePdfBuffer('Cliente inválido.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-invalid.pdf"`);
+      return res.end(pdf);
+    }
+
+    // Permite ignorar o gate de "última análise"
+    const force = ['1', 'true', 'yes', 'on'].includes(
+      String(req.query?.force ?? req.body?.force ?? '1').toLowerCase()
+    );
+    const useLastGate = !force && (process.env.ANALYSIS_USE_LAST_GATE === 'true');
+
+    // Checa chave da OpenAI
     const openaiKey = process.env.OPENAI_API_KEY;
-    // Se não houver chave, retornaremos uma mensagem informativa em vez de erro 500
     const analysisEnabled = !!openaiKey;
 
-    // Busca timestamp da última mensagem analisada para o cliente
+    // Busca timestamp da última análise apenas se o gate estiver ativado
     let lastTs = null;
-    try {
-      const r = await pool.query(
-        `SELECT analysis_last_msg_ts FROM client_settings WHERE slug = $1`,
-        [slug]
-      );
-      lastTs = r.rows?.[0]?.analysis_last_msg_ts || null;
-    } catch {}
-
-    console.log(`[export-analysis] client=${slug} lastTs=${lastTs}`);
+    if (useLastGate) {
+      try {
+        const r = await pool.query(
+          `SELECT analysis_last_msg_ts FROM client_settings WHERE slug = $1`,
+          [slug]
+        );
+        lastTs = r.rows?.[0]?.analysis_last_msg_ts || null;
+      } catch {}
+    }
 
     // Resolve token da instância
     await refreshInstances(false);
     const token = resolveInstanceToken(id);
     if (!token) {
-      return res.status(404).json({ error: 'Instância não encontrada ou sem token' });
+      const pdf = generatePdfBuffer('Instância não encontrada ou sem token.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${slug}.pdf"`);
+      return res.end(pdf);
     }
 
-    console.log(`[export-analysis] Token resolvido para ${id}: ${token ? 'OK' : 'NULO'}`);
-
-    // ==================== Início da nova lógica de análise ====================
-    // Registramos o início da análise no log
     appendLog(`🟢 Início da análise - Cliente: ${slug}`);
     const startTime = Date.now();
 
-    // 1) Busca e filtra os chats recentes
-    // Busca todos os chats da instância (paginação)
+    // 1) Coleta e ordena os chats
     const pageSize = 100;
     let offsetChats = 0;
     const chats = [];
@@ -1598,108 +1602,68 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
       if (page.length < pageSize) break;
       offsetChats += pageSize;
     }
-    // Ordena chats pelo timestamp da última mensagem (desc) e limita a ANALYSIS_MAX_CHATS
     const chatLastTs = (c) =>
-      c?.wa_lastTimestamp ||
-      c?.lastMessageTimestamp ||
-      c?.updatedAt ||
-      c?.createdAt ||
-      0;
-    chats.sort((a, b) => {
-      const at = Number(chatLastTs(a)) || 0;
-      const bt = Number(chatLastTs(b)) || 0;
-      return bt - at;
-    });
+      c?.wa_lastTimestamp || c?.lastMessageTimestamp || c?.updatedAt || c?.createdAt || 0;
+    chats.sort((a, b) => Number(chatLastTs(b)) - Number(chatLastTs(a)));
     const selectedChats = chats.slice(0, ANALYSIS_MAX_CHATS);
 
-    // 2) Para cada chat, coleta as últimas ANALYSIS_PER_CHAT_LIMIT mensagens e filtra as novas
+    // 2) Coleta mensagens por chat
     let allMessages = [];
     let maxTs = lastTs ? new Date(lastTs).getTime() : 0;
     for (const chat of selectedChats) {
       const chatId = extractChatId(chat);
       if (!chatId) continue;
-      // Pega as últimas N mensagens do chat
       const data = await uaz.findMessages(token, {
         chatid: chatId,
         limit: ANALYSIS_PER_CHAT_LIMIT,
         offset: 0,
       });
       const msgs = pickArrayList(data);
-      // Ordena pelas mais antigas primeiro (caso a API retorne ordem inversa)
       msgs.sort((a, b) => {
-        const ta =
-          a?.messageTimestamp ||
-          a?.timestamp ||
-          a?.wa_timestamp ||
-          a?.createdAt ||
-          a?.date ||
-          0;
-        const tb =
-          b?.messageTimestamp ||
-          b?.timestamp ||
-          b?.wa_timestamp ||
-          b?.createdAt ||
-          b?.date ||
-          0;
+        const ta = a?.messageTimestamp || a?.timestamp || a?.wa_timestamp || a?.createdAt || a?.date || 0;
+        const tb = b?.messageTimestamp || b?.timestamp || b?.wa_timestamp || b?.createdAt || b?.date || 0;
         return Number(ta) - Number(tb);
       });
+
       for (const msg of msgs) {
-        // extrai timestamp numérico
-        const rawTs =
-          msg?.messageTimestamp ||
-          msg?.timestamp ||
-          msg?.wa_timestamp ||
-          msg?.createdAt ||
-          msg?.date ||
-          null;
+        const rawTs = msg?.messageTimestamp || msg?.timestamp || msg?.wa_timestamp || msg?.createdAt || msg?.date || null;
         let numTs = null;
         if (rawTs) {
           if (typeof rawTs === 'string' && /^\d+$/.test(rawTs)) {
-            const n = Number(rawTs);
-            numTs = n < 10 ** 12 ? n * 1000 : n;
+            const n = Number(rawTs); numTs = n < 10 ** 12 ? n * 1000 : n;
           } else {
             const n = Number(rawTs);
-            if (Number.isFinite(n)) {
-              numTs = n < 10 ** 12 ? n * 1000 : n;
-            } else {
-              const d = new Date(rawTs);
-              const ms = d.getTime();
-              numTs = Number.isNaN(ms) ? null : ms;
-            }
+            if (Number.isFinite(n)) numTs = n < 10 ** 12 ? n * 1000 : n;
+            else { const d = new Date(rawTs); const ms = d.getTime(); numTs = Number.isNaN(ms) ? null : ms; }
           }
         }
         if (numTs == null) continue;
-        if (lastTs && numTs <= new Date(lastTs).getTime()) {
-          continue; // ignora antigas
-        }
+        // Só aplica o gate se estiver ativado
+        if (useLastGate && lastTs && numTs <= new Date(lastTs).getTime()) continue;
+
         allMessages.push({ timestamp: numTs, msg });
         if (numTs > maxTs) maxTs = numTs;
       }
     }
 
+    // Sem mensagens novas (ou gate desligado e ainda assim nada para analisar)
     if (!allMessages.length) {
-      appendLog('ℹ️ Nenhuma mensagem nova para analisar.');
-      console.log(`[export-analysis] Nenhuma nova mensagem encontrada para ${slug}`);
-      return res.json({ ok: true, suggestions: '', info: 'Nenhuma mensagem nova para analisar.' });
+      const pdf = generatePdfBuffer('Nenhuma mensagem nova para analisar.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${slug}.pdf"`);
+      return res.end(pdf);
     }
 
-    // Ordena todas as mensagens novas por timestamp asc
+    // 3) Transcrição compacta
     allMessages.sort((a, b) => a.timestamp - b.timestamp);
-
-    // 3) Constrói linhas de transcrição compactas
     const lines = allMessages.map(({ msg }) => toTranscriptLine(msg)).filter(Boolean);
 
-    // 4) Define prompts
-    // Permite sobrescrever o prompt do papel "system" via variável de ambiente OPENAI_SYSTEM_PROMPT (já lida em SYSTEM_PROMPT_OVERRIDE).
-    // Caso queira personalizar o comportamento global do analista, defina OPENAI_SYSTEM_PROMPT no .env ou no Railway.
+    // 4) Prompts
     const systemPrompt = SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT;
-    // Monta a introdução do usuário de forma dinâmica, indicando o número de mensagens e o slug do cliente.
     const userIntro = `A seguir está a transcrição (resumida) de ${lines.length} mensagens recentes do cliente ${slug}. Analise o conteúdo e proponha melhorias.`;
-
-    // tokens fixos: system + intro + margem
     const baseTokens = approxTokens(systemPrompt) + approxTokens(userIntro) + 50;
 
-    // 5) Chunking baseado no orçamento de tokens
+    // 5) Chunking por orçamento de tokens
     const chunks = [];
     let current = [];
     let currentTokens = baseTokens;
@@ -1714,21 +1678,15 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
         currentTokens += t;
       }
     }
-    if (current.length) {
-      chunks.push(current.join('\n'));
-    }
+    if (current.length) chunks.push(current.join('\n'));
+    appendLog(`→ Coletados ${selectedChats.length} chats e ${lines.length} mensagens. Lotes: ${chunks.length}.`);
 
-    appendLog(`→ Coletados ${selectedChats.length} chats e ${lines.length} mensagens (após filtro). Lotes: ${chunks.length}.`);
-
+    // 6) Chamada à OpenAI
     let suggestions = '';
-    let infoMessage = '';
-
     if (analysisEnabled) {
-      const key = openaiKey;
       const results = [];
       for (let i = 0; i < chunks.length; i++) {
         const content = `${userIntro}\n\n${chunks[i]}`;
-        // Constrói o payload dinamicamente, ajustando nome de parâmetro de tokens e temperatura
         const payload = {
           model: ANALYSIS_MODEL,
           messages: [
@@ -1737,116 +1695,67 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
           ],
           n: 1,
         };
-        // Detecta se o modelo é de raciocínio (GPT‑5, GPT‑4o, O-series) para ajustar parâmetros suportados
         const lowerModel = String(ANALYSIS_MODEL || '').toLowerCase();
         const isReasoningModel = /gpt-5|gpt-4o|\bo[123]\b|\bomni/i.test(lowerModel);
         if (isReasoningModel) {
-          // Modelos de raciocínio usam max_completion_tokens em vez de max_tokens
           payload.max_completion_tokens = ANALYSIS_OUTPUT_BUDGET;
-          // Especifica o formato da resposta para texto simples e o esforço de raciocínio
           payload.response_format = { type: 'text' };
           payload.reasoning_effort = process.env.OPENAI_REASONING_EFFORT || 'low';
         } else {
-          // Modelos clássicos (GPT‑3.5/4) usam max_tokens
           payload.max_tokens = ANALYSIS_OUTPUT_BUDGET;
-          // Define temperatura para modelos que suportam (padrão 0.5 ou configurável)
           const tempEnv = process.env.OPENAI_TEMPERATURE;
           const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : 0.5;
           if (!Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
         }
         try {
           const response = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
-            headers: {
-              Authorization: `Bearer ${key}`,
-              'Content-Type': 'application/json',
-            },
+            headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
             timeout: 45000,
           });
           const text = response?.data?.choices?.[0]?.message?.content || '';
-          // Loga a resposta bruta (encurtada) para depuração
-          const rawSnippet = text ? text.slice(0, 120).replace(/\n/g, ' ') + (text.length > 120 ? '…' : '') : '(resposta vazia)';
-          appendLog(`📦 Retorno do lote ${i + 1}: ${rawSnippet}`);
-        if (text) {
-            // Adiciona apenas o texto das sugestões, sem cabeçalhos por lote.
-            results.push(text.trim());
-            appendLog(`✅ Lote ${i + 1} concluído (tamanho aprox. chunk: ${chunks[i].length} chars).`);
-        } else {
-            appendLog(`⚠️ Lote ${i + 1} retornou texto vazio.`);
-        }
+          if (text) results.push(text.trim());
         } catch (err) {
           const msgErr = err.response?.data?.error?.message || err.message || err.toString();
           console.error('Erro ao chamar OpenAI', msgErr);
-          appendLog(`❌ Falha no lote ${i + 1}: ${msgErr}`);
         }
       }
-      // Concatena os resultados com separadores simples. Remove cabeçalhos desnecessários.
       suggestions = results.join('\n\n---\n\n');
-      if (!suggestions) {
-        infoMessage = 'Sem sugestões geradas (modelo pode ter retornado vazio).';
-        console.log(`[export-analysis] Modelo retornou vazio para ${slug} — nenhum texto nos lotes`);
-      }
     } else {
-      infoMessage = 'Análise indisponível: OPENAI_API_KEY não configurada.';
-      appendLog('❌ Análise indisponível: OPENAI_API_KEY não configurada.');
+      const pdf = generatePdfBuffer('Análise indisponível: OPENAI_API_KEY não configurada.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${slug}.pdf"`);
+      return res.end(pdf);
     }
 
-    // 6) Atualiza last analysis timestamp com a data mais recente processada
+    // 7) Atualiza last_ts APENAS se o gate estiver ativo
     try {
-      await pool.query(
-        `UPDATE client_settings SET analysis_last_msg_ts = $2 WHERE slug = $1`,
-        [slug, new Date(maxTs).toISOString()]
-      );
+      if (useLastGate && maxTs) {
+        await pool.query(
+          `UPDATE client_settings SET analysis_last_msg_ts = $2 WHERE slug = $1`,
+          [slug, new Date(maxTs).toISOString()]
+        );
+      }
     } catch (e) {
       console.error('Erro ao atualizar analysis_last_msg_ts', slug, e);
-      appendLog(`⚠️ Falha ao atualizar analysis_last_msg_ts para ${slug}: ${e.message || e}`);
     }
 
-    // 6.5) Opcional: grava o conteúdo das sugestões em um arquivo para posterior consulta.
-    // Ao salvar o relatório no disco, facilita a visualização fora da API e mantém um
-    // histórico das análises. O arquivo será criado em analysis_reports/ com nome
-    // baseado no slug do cliente e na data/hora atual. Caso a pasta não exista,
-    // ela será criada.
-    try {
-      const reportDir = path.join(__dirname, 'analysis_reports');
-      fs.mkdirSync(reportDir, { recursive: true });
-      const safeSlug = slug.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const reportPath = path.join(reportDir, `${safeSlug}-${timestamp}.pdf`);
-      // Conteúdo do relatório: sugestões ou texto padrão caso vazio
-      const reportContent = suggestions || 'Nenhuma sugestão gerada.';
-      // Gera buffer PDF usando utilidade do módulo
-      const pdfBuffer = generatePdfBuffer(reportContent);
-      fs.writeFileSync(reportPath, pdfBuffer);
-      // Anexa informação ao campo info para retorno ao frontend
-      const infoAdd = `Relatório em PDF salvo em ${reportPath}`;
-      if (infoMessage) {
-        infoMessage += infoAdd.startsWith(' ') ? infoAdd : ' ' + infoAdd;
-      } else {
-        infoMessage = infoAdd;
-      }
-    } catch (e) {
-      console.error('Erro ao salvar relatório de análise', e);
-      appendLog(`⚠️ Erro ao salvar relatório de análise: ${e.message || e}`);
-    }
-
-    // Loga fim da análise
+    // 8) Gera e devolve PDF (sempre)
     const elapsed = Date.now() - startTime;
     appendLog(`🏁 Fim da análise — ${chunks.length} lotes, tempo total ${elapsed}ms`);
-
-    // === Geração do PDF de sugestões ===
-    // Utiliza o texto das sugestões (ou mensagem padrão) para criar um PDF e devolvê-lo como download.
-    const pdfText = suggestions || 'Nenhuma sugestão gerada.';
-    const finalPdfBuffer = generatePdfBuffer(pdfText);
-    // Configura cabeçalhos para download de PDF
+    const finalText = suggestions || 'Nenhuma sugestão gerada.';
+    const finalPdf = generatePdfBuffer(finalText);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${slug}.pdf"`);
-    return res.end(finalPdfBuffer);
-    // ==================== Fim da nova lógica de análise ====================
+    return res.end(finalPdf);
   } catch (err) {
     console.error('Erro em export-analysis', err);
-    return res.status(500).json({ error: String(err.message || err) });
+    const pdf = generatePdfBuffer(`Erro na análise: ${String(err.message || err)}`);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="analysis-error.pdf"`);
+    return res.end(pdf);
   }
 });
+
 
 // Button reply (Native Flow)
 app.post('/api/instances/:id/interactive/reply', async (req, res) => {
