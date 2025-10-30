@@ -1809,12 +1809,14 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
       fs.mkdirSync(reportDir, { recursive: true });
       const safeSlug = slug.replace(/[^a-zA-Z0-9_-]/g, '_');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const reportPath = path.join(reportDir, `${safeSlug}-${timestamp}.txt`);
-      // Concatena sugestões ou informa caso esteja vazio
+      const reportPath = path.join(reportDir, `${safeSlug}-${timestamp}.pdf`);
+      // Conteúdo do relatório: sugestões ou texto padrão caso vazio
       const reportContent = suggestions || 'Nenhuma sugestão gerada.';
-      fs.writeFileSync(reportPath, reportContent, 'utf8');
+      // Gera buffer PDF usando utilidade do módulo
+      const pdfBuffer = generatePdfBuffer(reportContent);
+      fs.writeFileSync(reportPath, pdfBuffer);
       // Anexa informação ao campo info para retorno ao frontend
-      const infoAdd = `Relatório salvo em ${reportPath}`;
+      const infoAdd = `Relatório em PDF salvo em ${reportPath}`;
       if (infoMessage) {
         infoMessage += infoAdd.startsWith(' ') ? infoAdd : ' ' + infoAdd;
       } else {
