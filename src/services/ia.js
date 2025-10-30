@@ -57,33 +57,29 @@ function normalizePhoneE164BR(phone) {
  * @returns {string}
  */
 function fillTemplate(tpl, vars) {
-  // Gera saudação automática conforme horário atual
+  // Gera saudação automática conforme horário atual (Bom dia / Boa tarde / Boa noite)
   const now = new Date();
   const hour = now.getHours();
   let saudacao;
-  if (hour >= 5 && hour < 12) saudacao = "Bom dia ";
-  else if (hour >= 12 && hour < 18) saudacao = "Boa tarde ";
-  else saudacao = "Boa noite ";
+  if (hour >= 5 && hour < 12) saudacao = 'Bom dia \u2600\uFE0F';
+  else if (hour >= 12 && hour < 18) saudacao = 'Boa tarde \uD83C\uDF24\uFE0F';
+  else saudacao = 'Boa noite \uD83C\uDF19';
 
-  // Adiciona ao mapa de variáveis
+  // Adiciona a saudação às variáveis
   vars = { ...vars, SAUDACAO: saudacao };
 
-  // Substitui campos do template por variáveis fornecidas
-  return String(tpl || "").replace(
-    /\{(NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE|SAUDACAO|GREETING)\}/gi,
-    (_, k) => {
-      const key = k.toUpperCase();
-      const map = {
-        NOME: "NAME",
-        CLIENTE: "CLIENT",
-        TELEFONE: "PHONE",
-        NICHE: "NICHO",
-        GREETING: "SAUDACAO",
-      };
-      const finalKey = map[key] || key;
-      return vars[finalKey] ?? "";
-    }
-  );
+  return String(tpl || '').replace(/\{(NAME|NOME|CLIENT|CLIENTE|PHONE|TELEFONE|NICHO|NICHE|SAUDACAO|GREETING)\}/gi, (_, k) => {
+    const key = k.toUpperCase();
+    const map = {
+      NOME: 'NAME',
+      CLIENTE: 'CLIENT',
+      TELEFONE: 'PHONE',
+      NICHE: 'NICHO',
+      GREETING: 'SAUDACAO',
+    };
+    const finalKey = map[key] || key;
+    return vars[finalKey] ?? '';
+  });
 }
 
 /**
