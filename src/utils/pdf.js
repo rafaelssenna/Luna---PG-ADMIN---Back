@@ -51,7 +51,13 @@ function generatePdfBuffer(text) {
   const obj1 = '1 0 obj<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
   const obj2 = '2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
   const obj3 = '3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n';
-  const obj4 = '4 0 obj<< /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica >>\nendobj\n';
+  // Especifica explicitamente a codificação WinAnsiEncoding para a fonte Helvetica.  Sem
+  // informar uma codificação, o PDF usa StandardEncoding, que não contém muitos
+  // caracteres acentuados, resultando em erros como “Observaçæes” no PDF.  O
+  // WinAnsiEncoding (equivalente ao Windows‑1252) mapeia códigos 0x80‑0xFF
+  // para os glifos corretos na fonte Helvetica. Isso permite exibir letras
+  // como ç, ã, õ, Á etc. de forma correta.
+  const obj4 = '4 0 obj<< /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n';
   const obj5 = `5 0 obj<< /Length ${streamLength} >>\nstream\n${contentStream}\nendstream\nendobj\n`;
   const header = '%PDF-1.4\n';
   const objects = [obj1, obj2, obj3, obj4, obj5];
