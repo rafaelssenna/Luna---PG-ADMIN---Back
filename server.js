@@ -1615,7 +1615,9 @@ app.get('/api/debug/ping-openai', async (req, res) => {
           { role: 'system', content: 'Você é um respondedor de ping.' },
           { role: 'user', content: 'Diga "OK" se estiver funcionando.' },
         ],
-        max_output_tokens: 10,
+        // A API de respostas requer pelo menos 16 tokens de saída. Definimos 32
+        // para manter a margem e evitar erros de validação.
+        max_output_tokens: 32,
         reasoning: { effort: 'low' },
       };
     } else {
