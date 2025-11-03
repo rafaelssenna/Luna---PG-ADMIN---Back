@@ -10,6 +10,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
+const crypto = require('crypto'); // adicionado para gerar IDs únicos
 
 const app = express();
 
@@ -282,6 +283,16 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 function validateSlug(slug) {
   return /^cliente_[a-z0-9_]+$/.test(slug) || /^[a-z0-9_]+$/.test(slug);
+}
+
+// Gera um identificador único para correlacionar logs de análise.
+// Tenta usar crypto.randomUUID se disponível, caso contrário usa um fallback pseudo-único.
+function makeReqId() {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+  }
 }
 
 /* ======================  Estado e SSE por cliente  ====================== */
@@ -1556,10 +1567,14 @@ app.post('/api/instances/:id/export-analysis', async (req, res) => {
     // Força por padrão, salvo se o query/body especificar explicitamente outro valor
     const forceRaw = req.query?.force ?? req.body?.force ?? '1';
     const force = ['1', 'true', 'yes', 'on'].includes(String(forceRaw).toLowerCase());
-    const pdfBuffer = await generateAnalysisPdf(id, slug, force);
+    // Gera um identificador de requisição para rastrear logs desta exportação
+    const reqId = req.headers['x-request-id']?.toString() || makeReqId();
+    console.log(`[ANALYSIS][${reqId}] start id=${id} slug=${slug} force=${force}`);
+    const pdfBuffer = await generateAnalysisPdf(id, slug, force, { reqId });
     res.setHeader('Content-Type', 'application/pdf');
     const filenameSlug = slug && /^[a-z0-9_]+$/.test(slug) ? slug : 'client';
     res.setHeader('Content-Disposition', `attachment; filename="analysis-${id}-${filenameSlug}.pdf"`);
+    console.log(`[ANALYSIS][${reqId}] end -> pdf ${pdfBuffer?.length || 0} bytes`);
     return res.end(pdfBuffer);
   } catch (err) {
     console.error('Erro em export-analysis', err);
@@ -1685,9 +1700,13 @@ app.get('/api/instances/:id/export-analysis.pdf', async (req, res) => {
       return res.status(400).json({ error: 'Cliente inválido' });
     }
     const force = ['1', 'true', 'yes', 'on'].includes(String(req.query?.force || '0').toLowerCase());
-    const pdfBuffer = await generateAnalysisPdf(id, slug, force);
+    // Identificador de requisição para rastreamento
+    const reqId = req.headers['x-request-id']?.toString() || makeReqId();
+    console.log(`[ANALYSIS][${reqId}] start (GET) id=${id} slug=${slug} force=${force}`);
+    const pdfBuffer = await generateAnalysisPdf(id, slug, force, { reqId });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="report-${id}-${slug}.pdf"`);
+    console.log(`[ANALYSIS][${reqId}] end (GET) -> pdf ${pdfBuffer?.length || 0} bytes`);
     return res.end(pdfBuffer);
   } catch (err) {
     console.error('Erro em export-analysis.pdf', err);
