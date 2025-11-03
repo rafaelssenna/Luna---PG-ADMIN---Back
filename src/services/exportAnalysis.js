@@ -1,8 +1,14 @@
 /*
  * src/services/exportAnalysis.js
  *
- * Gera relatório em PDF com sugestões da IA a partir das conversas recentes.
- * Compatível com a API /v1/responses (modelos reasoning) e com chat/completions.
+ * Este módulo é responsável por gerar relatórios de análise de conversas em
+ * formato PDF utilizando um modelo de IA da OpenAI. A lógica coleta
+ * conversas recentes, chama o modelo para produzir sugestões de melhoria e
+ * gera um PDF com essas sugestões. Nesta versão, após gerar o PDF
+ * tradicional via generatePdfBuffer, ele é pós‑processado para corrigir
+ * possíveis problemas de codificação UTF‑8 e adicionar uma capa
+ * personalizada com logotipo e título. Para isso utiliza o módulo
+ * pdfModifier.
  */
 
 const axios = require('axios');
@@ -22,6 +28,8 @@ const {
 const { approxTokens, toTranscriptLine } = require('../utils/text');
 const { generatePdfBuffer } = require('../utils/pdf');
 const helpers = require('../../utils/helpers');
+// Importa o modificador de PDF para pós‑processamento (capa e UTF‑8)
+const { modifyPdf } = require('./pdfModifier');
 
 // ======= Debug / Logging =======
 const ANALYSIS_DEBUG = String(process.env.ANALYSIS_DEBUG || process.env.DEBUG || 'false')
@@ -342,7 +350,22 @@ async function generateAnalysisPdf(instanceId, slug, force = true, opts = {}) {
     if (ANALYSIS_DEBUG) log(reqId, `no suggestions: ${callErrors[0]}`);
   }
 
-  return generatePdfBuffer(finalText);
+  // Gera o PDF base a partir das sugestões (ou mensagem de erro)
+  const basePdfBuffer = await generatePdfBuffer(finalText);
+
+  // Pós‑processa o PDF para corrigir acentuação e adicionar capa personalizada.
+  // Os caminhos e texto da capa podem ser configurados via variáveis de ambiente.
+  const logoPath = process.env.ANALYSIS_PDF_LOGO_PATH || null;
+  const title = process.env.ANALYSIS_PDF_TITLE || 'Relatório de Análise';
+
+  try {
+    const modifiedPdf = await modifyPdf(basePdfBuffer, logoPath, title);
+    return modifiedPdf;
+  } catch (err) {
+    // Caso ocorra algum erro no pós‑processamento, retorna o PDF original para não falhar.
+    console.warn('Falha ao modificar o PDF:', err?.message || err);
+    return basePdfBuffer;
+  }
 }
 
 module.exports = { generateAnalysisPdf };
