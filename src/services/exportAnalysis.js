@@ -2,7 +2,7 @@
  * src/services/exportAnalysis.js
  *
  * Gera relatório em PDF com sugestões da IA a partir das conversas recentes.
- * Robusto para a API /v1/responses (modelos reasoning) e para chat/completions.
+ * Compatível com a API /v1/responses (modelos reasoning) e com chat/completions.
  */
 
 const axios = require('axios');
@@ -155,7 +155,7 @@ function isReasoningModelName(name) {
 
 /**
  * Chama OpenAI (Responses API / Chat) e SEMPRE retorna { responses, errors }.
- * Mais resiliente na extração de texto.
+ * Sem 'response_format' para evitar 400 em contas/versões onde ele não é aceito.
  */
 async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId) {
   const responses = [];
@@ -170,14 +170,13 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId) {
       let text = '';
 
       if (reasoning) {
-        // Responses API — força texto e trata vários formatos de retorno
+        // Responses API — sem 'response_format'
         const payload = {
           model,
           input: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
           ],
-          response_format: { type: 'text' }, // garante data.output_text
           max_output_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
           reasoning: { effort: process.env.OPENAI_REASONING_EFFORT || 'low' },
         };
@@ -197,25 +196,23 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId) {
         if (resp.status >= 400) {
           errors.push(resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`);
         } else {
-          // 1) caminho preferido
+          // 1) texto direto
           if (typeof resp?.data?.output_text === 'string' && resp.data.output_text.trim()) {
             text = resp.data.output_text.trim();
           }
-
-          // 2) mensagem estruturada em data.output[].content[].text
+          // 2) output[].content[].text
           if (!text && Array.isArray(resp?.data?.output)) {
             const parts = [];
             for (const out of resp.data.output) {
-              const contentArr = Array.isArray(out?.content) ? out.content : [];
-              for (const c of contentArr) {
+              const arr = Array.isArray(out?.content) ? out.content : [];
+              for (const c of arr) {
                 if (typeof c?.text === 'string') parts.push(c.text);
-                else if (typeof c === 'string')   parts.push(c);
+                else if (typeof c === 'string') parts.push(c);
               }
             }
             text = parts.join('\n').trim();
           }
-
-          // 3) alguns backends ainda retornam choices
+          // 3) choices (alguns backends ainda retornam)
           if (!text && Array.isArray(resp?.data?.choices)) {
             text = resp.data.choices
               .map(c => c?.message?.content || c?.text || '')
@@ -223,7 +220,6 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId) {
               .join('\n')
               .trim();
           }
-
           // 4) fallback final: chat/completions
           if (!text) {
             const chatPayload = {
