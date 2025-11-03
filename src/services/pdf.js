@@ -54,7 +54,7 @@ function generatePdfBuffer(text) {
     }
   }
   const contentStream = `/F1 12 Tf\n` + textCommands;
-  const streamLength = Buffer.byteLength(contentStream, 'latin1');
+  const streamLength = Buffer.byteLength(contentStream, 'utf8');
   const obj1 = '1 0 obj<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
   const obj2 = '2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
   const obj3 = '3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n';
@@ -79,7 +79,7 @@ function generatePdfBuffer(text) {
   }
   const trailer = `trailer<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`;
   const pdfString = header + obj1 + obj2 + obj3 + obj4 + obj5 + xref + trailer;
-  return Buffer.from(pdfString, 'latin1');
+  return Buffer.from(pdfString, 'utf8');
 }
 
 module.exports = { escapePdfString, generatePdfBuffer };
