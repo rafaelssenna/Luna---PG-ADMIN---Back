@@ -55,15 +55,7 @@ async function resolveInstanceToken(instanceId) {
       const id = x.id || x._id || x.instanceId || x.token;
       return String(id) === String(instanceId);
     });
-    if (!it) {
-      // Fallback: caso o ID fornecido já seja o próprio token da instância.
-      // Isso é útil quando o front passa o token diretamente em vez do identificador numérico.
-      if (instanceId && typeof instanceId === 'string' && instanceId.length > 4) {
-        // evita retornar strings vazias ou muito curtas; aceita tokens longos
-        return instanceId;
-      }
-      return null;
-    }
+    if (!it) return null;
     return it.token || it.instanceToken || it.key || null;
   } catch (err) {
     console.error('Erro ao resolver token da instância', err);
