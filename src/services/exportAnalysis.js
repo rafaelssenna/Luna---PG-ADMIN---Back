@@ -309,71 +309,47 @@ function isReasoningModelName(name) {
  * @param {string} openaiKey Chave da API da OpenAI
  * @returns {Promise<{responses:string[],errors:string[]}>}
  */
-// substitua a função callOpenAI existente por esta versão
-async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
+async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId = undefined) {
   const responses = [];
   const errors = [];
-  // decide se o modelo é "reasoning"
-  const modelIsReasoning = isReasoningModelName(ANALYSIS_MODEL);
-
+  const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
+  const reasoning = isReasoningModelName(model);
   for (const contentBody of chunks) {
     const content = `${userIntro}\n\n${contentBody}`;
     try {
       let text = '';
-
-      if (modelIsReasoning) {
-        // tentativa principal: /v1/responses com response_format e max_completion_tokens
+      if (reasoning) {
         const payload = {
-          model: ANALYSIS_MODEL,
+          model,
           input: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
           ],
-          // prefer `max_completion_tokens` para forçar saída textual
-          max_completion_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
+          max_output_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
           reasoning: { effort: process.env.OPENAI_REASONING_EFFORT || 'low' },
-          response_format: { type: 'text' },
         };
-        const tempEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : undefined;
+        const tEnv = process.env.OPENAI_TEMPERATURE;
+        const parsedTemp = tEnv !== undefined ? Number(tEnv) : undefined;
         if (parsedTemp !== undefined && !Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-
+        const startTs = Date.now();
         const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
           headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
           timeout: 60000,
+          validateStatus: () => true,
         });
-
-        // debug útil — descomente se quiser logar todo retorno
-        // console.log('OPENAI responses raw:', JSON.stringify(resp.data));
-
-        // tenta extrair texto (várias formações possíveis)
-        text = resp?.data?.output_text || resp?.data?.output?.[0]?.content?.[0]?.text || '';
-        // fallback: se não veio texto, tenta extrair choices
-        if (!text && resp?.data?.choices && resp.data.choices.length) {
-          text = resp.data.choices.map(c => c?.message?.content || '').join('\n').trim();
+        if (ANALYSIS_DEBUG && reqId) {
+          const usage = resp?.data?.usage || {};
+          log(reqId, `openai responses status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
         }
-
-        // Se não veio nada, faz fallback para chat completions (mais compatível)
-        if (!text) {
-          const chatPayload = {
-            model: ANALYSIS_MODEL,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content },
-            ],
-            max_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
-            n: 1,
-          };
-          const chatResp = await axios.post('https://api.openai.com/v1/chat/completions', chatPayload, {
-            headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-            timeout: 60000,
-          });
-          text = chatResp?.data?.choices?.[0]?.message?.content || '';
+        if (resp.status >= 400) {
+          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
+          errors.push(errMsg);
+        } else {
+          text = resp?.data?.output_text || resp?.data?.choices?.[0]?.message?.content || '';
         }
       } else {
-        // modelos clássicos -> chat completions
         const payload = {
-          model: ANALYSIS_MODEL,
+          model,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
@@ -381,30 +357,41 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
           n: 1,
           max_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
         };
-        const tempEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : 0.5;
+        const tEnv = process.env.OPENAI_TEMPERATURE;
+        const parsedTemp = tEnv !== undefined ? Number(tEnv) : 0.5;
         if (!Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-
+        const startTs = Date.now();
         const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
           headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
           timeout: 60000,
+          validateStatus: () => true,
         });
-        // console.log('OPENAI chat raw:', JSON.stringify(resp.data));
-        text = resp?.data?.choices?.[0]?.message?.content || '';
+        if (ANALYSIS_DEBUG && reqId) {
+          const usage = resp?.data?.usage || {};
+          log(reqId, `openai chat status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
+        }
+        if (resp.status >= 400) {
+          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
+          errors.push(errMsg);
+        } else {
+          text = resp?.data?.choices?.[0]?.message?.content || '';
+        }
       }
-
-      if (text) responses.push(String(text).trim());
-      else errors.push('Resposta vazia do modelo (nenhum texto retornado).');
+      if (text && text.trim()) {
+        const trimmed = text.trim();
+        if (ANALYSIS_DEBUG && reqId) {
+          log(reqId, `chunk ok text[0..120]=${JSON.stringify(trimmed.slice(0, 120))}`);
+        }
+        responses.push(trimmed);
+      }
     } catch (err) {
-      const msgErr = err.response?.data?.error?.message || err.message || String(err);
-      console.error('Erro ao chamar OpenAI', msgErr);
+      const msgErr = err.response?.data?.error?.message || err.message || err.toString();
       errors.push(msgErr);
+      console.error('[ANALYSIS] Erro ao chamar OpenAI', msgErr);
     }
   }
-
   return { responses, errors };
 }
-
 
 /**
  * Gera um relatório em PDF a partir das conversas recentes de uma
@@ -479,9 +466,10 @@ async function generateAnalysisPdf(instanceId, slug, force = true, opts = {}) {
   let suggestions = '';
   let errors = [];
   {
-    const { results, errorsCollected } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId);
-    suggestions = results.join('\n\n---\n\n');
-    errors = errorsCollected;
+    const { responses, errors: callErrors } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId);
+    // "responses" is an array of suggestion strings from OpenAI. Use join to combine them.
+    suggestions = Array.isArray(responses) ? responses.join('\n\n---\n\n') : '';
+    errors = callErrors;
   }
 
   // Atualiza lastTs somente se gate ativo
