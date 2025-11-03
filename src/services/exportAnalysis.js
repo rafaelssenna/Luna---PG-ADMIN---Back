@@ -34,6 +34,34 @@ const { approxTokens, toTranscriptLine } = require('../utils/text');
 const { generatePdfBuffer } = require('../utils/pdf');
 const helpers = require('../../utils/helpers');
 
+// ======= Logging helpers =======
+// Ativa logs detalhados quando ANALYSIS_DEBUG ou DEBUG estiverem definidos.
+const ANALYSIS_DEBUG = String(process.env.ANALYSIS_DEBUG || process.env.DEBUG || 'false').toLowerCase() === 'true';
+
+/**
+ * Emite logs padronizados da análise, prefixando com o ID da requisição.
+ * @param {string} reqId Identificador de correlação
+ * @param  {...any} args Mensagens a serem logadas
+ */
+function log(reqId, ...args) {
+  try {
+    console.log(`[ANALYSIS][${reqId}]`, ...args);
+  } catch (e) {
+    // ignora falhas de log
+  }
+}
+
+/**
+ * Mascara tokens longos para que não vazem em logs.
+ * @param {string} tok Token a ser mascarado
+ * @returns {string}
+ */
+function maskToken(tok) {
+  if (!tok || typeof tok !== 'string') return '';
+  if (tok.length <= 8) return '***';
+  return tok.slice(0, 4) + '…' + tok.slice(-4);
+}
+
 /**
  * Resolve o token da instância desejada consultando a UAZAPI com o
  * token de administrador. Isso substitui o cache global de instâncias
@@ -281,18 +309,18 @@ function isReasoningModelName(name) {
  * @param {string} openaiKey Chave da API da OpenAI
  * @returns {Promise<{responses:string[],errors:string[]}>}
  */
-async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
+async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId = undefined) {
   const responses = [];
-  const errors = [];
-  const modelIsReasoning = isReasoningModelName(ANALYSIS_MODEL);
+  const errorsCollected = [];
+  const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
+  const reasoning = isReasoningModelName(model);
   for (const contentBody of chunks) {
     const content = `${userIntro}\n\n${contentBody}`;
     try {
       let text = '';
-      if (modelIsReasoning) {
-        // Para modelos de raciocínio, usamos a API de responses.
+      if (reasoning) {
         const payload = {
-          model: ANALYSIS_MODEL,
+          model,
           input: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
@@ -300,22 +328,28 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
           max_output_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
           reasoning: { effort: process.env.OPENAI_REASONING_EFFORT || 'low' },
         };
-        const tempEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : undefined;
+        const tEnv = process.env.OPENAI_TEMPERATURE;
+        const parsedTemp = tEnv !== undefined ? Number(tEnv) : undefined;
         if (parsedTemp !== undefined && !Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-        const resp = await axios.post(
-          'https://api.openai.com/v1/responses',
-          payload,
-          {
-            headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-            timeout: 60000,
-          }
-        );
-        text = resp?.data?.output_text || resp?.data?.choices?.[0]?.message?.content || '';
+        const startTs = Date.now();
+        const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
+          headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+          timeout: 60000,
+          validateStatus: () => true,
+        });
+        if (ANALYSIS_DEBUG && reqId) {
+          const usage = resp?.data?.usage || {};
+          log(reqId, `openai responses status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
+        }
+        if (resp.status >= 400) {
+          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
+          errorsCollected.push(errMsg);
+        } else {
+          text = resp?.data?.output_text || resp?.data?.choices?.[0]?.message?.content || '';
+        }
       } else {
-        // Modelos clássicos (chat) usam chat/completions.
         const payload = {
-          model: ANALYSIS_MODEL,
+          model,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
@@ -323,27 +357,40 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
           n: 1,
           max_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
         };
-        const tempEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tempEnv !== undefined ? Number(tempEnv) : 0.5;
+        const tEnv = process.env.OPENAI_TEMPERATURE;
+        const parsedTemp = tEnv !== undefined ? Number(tEnv) : 0.5;
         if (!Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-        const resp = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          payload,
-          {
-            headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-            timeout: 45000,
-          }
-        );
-        text = resp?.data?.choices?.[0]?.message?.content || '';
+        const startTs = Date.now();
+        const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
+          headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+          timeout: 60000,
+          validateStatus: () => true,
+        });
+        if (ANALYSIS_DEBUG && reqId) {
+          const usage = resp?.data?.usage || {};
+          log(reqId, `openai chat status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
+        }
+        if (resp.status >= 400) {
+          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
+          errorsCollected.push(errMsg);
+        } else {
+          text = resp?.data?.choices?.[0]?.message?.content || '';
+        }
       }
-      if (text) responses.push(String(text).trim());
+      if (text && text.trim()) {
+        const trimmed = text.trim();
+        if (ANALYSIS_DEBUG && reqId) {
+          log(reqId, `chunk ok text[0..120]=${JSON.stringify(trimmed.slice(0, 120))}`);
+        }
+        responses.push(trimmed);
+      }
     } catch (err) {
       const msgErr = err.response?.data?.error?.message || err.message || err.toString();
-      console.error('Erro ao chamar OpenAI', msgErr);
-      errors.push(msgErr);
+      errorsCollected.push(msgErr);
+      console.error('[ANALYSIS] Erro ao chamar OpenAI', msgErr);
     }
   }
-  return { responses, errors };
+  return { results: responses, errorsCollected };
 }
 
 /**
@@ -358,21 +405,27 @@ async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey) {
  * @param {boolean} force Ignora o gate de última análise se true
  * @returns {Promise<Buffer>} PDF pronto para ser enviado ao cliente
  */
-async function generateAnalysisPdf(instanceId, slug, force = true) {
+async function generateAnalysisPdf(instanceId, slug, force = true, opts = {}) {
   // Valida o slug (formato cliente_nome)
   if (!slug || !/^([a-z0-9_]+)$/.test(slug)) {
     return generatePdfBuffer('Cliente inválido.');
   }
 
+  // Gera identificador de requisição (reqId) para logs; usa opts.reqId se fornecido
+  const reqId = opts && opts.reqId ? opts.reqId : ('local-' + Date.now().toString(36));
   // Determina se o gate está habilitado
   const useGate = !force && (process.env.ANALYSIS_USE_LAST_GATE === 'true');
 
-  // Checa a chave da OpenAI
+  // Checa a chave e o modelo da OpenAI
   const openaiKey = process.env.OPENAI_API_KEY;
-  const analysisEnabled = !!openaiKey;
+  const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
+  if (!openaiKey || !model) {
+    return generatePdfBuffer('Análise indisponível: OPENAI_API_KEY/OPENAI_MODEL não configurado.');
+  }
 
   // Resolve token da instância
   const token = await resolveInstanceToken(instanceId);
+  if (ANALYSIS_DEBUG) log(reqId, `instance ${instanceId} -> token=${maskToken(token)}`);
   if (!token) {
     return generatePdfBuffer('Instância não encontrada ou sem token.');
   }
@@ -389,6 +442,10 @@ async function generateAnalysisPdf(instanceId, slug, force = true) {
   // 2) Coleta mensagens
   const { messages: allMessages, maxTs } = await collectMessages(token, chats, lastTs, useGate);
 
+  // Registra número total de chats e mensagens para fins de depuração
+  const totalMsgs = allMessages.length;
+  if (ANALYSIS_DEBUG) log(reqId, `chats=${chats.length} totalMsgs=${totalMsgs}`);
+
   if (!allMessages.length) {
     return generatePdfBuffer('Nenhuma mensagem nova para analisar.');
   }
@@ -396,21 +453,22 @@ async function generateAnalysisPdf(instanceId, slug, force = true) {
   // Ordena em ordem crescente
   allMessages.sort((a, b) => a.timestamp - b.timestamp);
   const lines = buildTranscript(allMessages);
-  const systemPrompt = SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT;
+  // Prompt de sistema: permite override via variável de ambiente e prompt de override
+  const systemPrompt = (process.env.OPENAI_SYSTEM_PROMPT || SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT || '').toString().trim() ||
+    'Você é um analista de desempenho conversacional. Gere sugestões práticas e diretas.';
+  // Texto de introdução para o usuário
   const userIntro =
-    `A seguir está a transcrição (resumida) de ${lines.length} mensagens recentes do cliente ${slug}. ` +
-    'Analise o conteúdo e proponha melhorias.';
+    `Contexto: A seguir estão amostras de conversas entre a assistente Luna e leads B2B do cliente "${slug}".` +
+    `\nGere um relatório curto em português com tópicos práticos de melhoria, exemplos reescritos e um resumo executivo em até 3 linhas.`;
   const chunks = chunkTranscript(lines, systemPrompt, userIntro);
   appendLog(`→ Coletados ${chats.length} chats e ${lines.length} mensagens. Lotes: ${chunks.length}.`);
 
   let suggestions = '';
   let errors = [];
-  if (analysisEnabled) {
-    const { responses, errors: errs } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey);
-    suggestions = responses.join('\n\n---\n\n');
-    errors = errs;
-  } else {
-    return generatePdfBuffer('Análise indisponível: OPENAI_API_KEY não configurada.');
+  {
+    const { results, errorsCollected } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId);
+    suggestions = results.join('\n\n---\n\n');
+    errors = errorsCollected;
   }
 
   // Atualiza lastTs somente se gate ativo
@@ -423,6 +481,9 @@ async function generateAnalysisPdf(instanceId, slug, force = true) {
   let finalText = suggestions || 'Nenhuma sugestão gerada.';
   if (!suggestions && errors && errors.length) {
     finalText = `Falha ao gerar sugestões.\nPrimeiro erro: ${errors[0]}`;
+    if (ANALYSIS_DEBUG) log(reqId, `no suggestions. errors=${errors[0]}`);
+  } else if (suggestions && ANALYSIS_DEBUG) {
+    log(reqId, `final length=${suggestions.length}`);
   }
   return generatePdfBuffer(finalText);
 }
