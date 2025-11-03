@@ -17,7 +17,33 @@
  */
 
 const fs = require('fs');
-const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+
+/*
+ * pdf-lib é utilizado para manipular PDFs em memória. Como este módulo
+ * depende de uma dependência externa, pode não estar instalado no ambiente
+ * em que o código está sendo executado. Para evitar erros de execução,
+ * tentamos carregar pdf-lib de forma segura. Caso não esteja disponível,
+ * as funções deste módulo simplesmente retornam o PDF original sem
+ * alterações, registrando um aviso no console.
+ */
+let PDFDocument;
+let rgb;
+let StandardFonts;
+try {
+  // Tenta importar o pdf-lib. Se a dependência não existir, estas
+  // variáveis permanecerão indefinidas e serão tratadas em modifyPdf.
+  const pdfLib = require('pdf-lib');
+  PDFDocument = pdfLib.PDFDocument;
+  rgb = pdfLib.rgb;
+  StandardFonts = pdfLib.StandardFonts;
+} catch (err) {
+  // Se pdf-lib não estiver instalado, registra um aviso. As operações de
+  // modificação serão ignoradas e o PDF será retornado intacto.
+  console.warn('Dependência pdf-lib não encontrada. Capa personalizada será ignorada.');
+  PDFDocument = null;
+  rgb = null;
+  StandardFonts = null;
+}
 
 /**
  * Corrige a codificação de caracteres de um PDF existente e adiciona uma capa.
@@ -35,6 +61,13 @@ const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 async function modifyPdf(pdfBuffer, logoPath = null, title = 'Relatório Técnico') {
   if (!pdfBuffer || !Buffer.isBuffer(pdfBuffer)) {
     throw new TypeError('pdfBuffer deve ser um Buffer');
+  }
+
+  // Se pdf-lib não estiver disponível, apenas retorna o PDF original sem
+  // realizar nenhuma modificação. Isto evita que a aplicação falhe
+  // completamente em ambientes sem a dependência instalada.
+  if (!PDFDocument || !rgb || !StandardFonts) {
+    return pdfBuffer;
   }
 
   // Carregue o PDF original a partir do buffer fornecido
