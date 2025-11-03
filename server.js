@@ -166,7 +166,15 @@ function findInstanceById(id) {
 }
 function resolveInstanceToken(id) {
   const inst = findInstanceById(id);
-  if (!inst) return null;
+  // Caso não encontre a instância no cache, assumimos que o próprio ID
+  // pode ser o token da instância. Esse fallback é útil quando o front
+  // passa o token diretamente ou quando o cache ainda não foi populado.
+  if (!inst) {
+    if (id && typeof id === 'string' && id.length > 4) {
+      return id;
+    }
+    return null;
+  }
   return inst.token || inst.instanceToken || inst.key || null;
 }
 
