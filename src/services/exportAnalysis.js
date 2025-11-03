@@ -1,19 +1,8 @@
 /*
  * src/services/exportAnalysis.js
  *
- * Este módulo encapsula toda a lógica de exportação e análise de conversas
- * da aplicação Luna. A rotina originalmente estava implementada dentro
- * do arquivo server.js, o que tornava o código extenso e difícil de
- * testar. Ao extrair para um serviço separado conseguimos organizar
- * melhor as responsabilidades, reutilizar funções em diferentes rotas e
- * facilitar futuras evoluções como novos modelos de IA ou fontes de dados.
- *
- * A função principal, `generateAnalysisPdf`, coleta mensagens recentes de
- * uma instância UAZ, compila uma transcrição resumida, invoca a API da
- * OpenAI com o modelo configurado e finalmente retorna um Buffer com um
- * relatório em PDF contendo as sugestões produzidas pela IA. Além disso
- * atualiza o campo `analysis_last_msg_ts` no banco de dados para evitar
- * reprocessar conversas já analisadas, quando o gate estiver ativo.
+ * Gera relatório em PDF com sugestões da IA a partir das conversas recentes.
+ * Robusto para a API /v1/responses (modelos reasoning) e para chat/completions.
  */
 
 const axios = require('axios');
@@ -34,62 +23,21 @@ const { approxTokens, toTranscriptLine } = require('../utils/text');
 const { generatePdfBuffer } = require('../utils/pdf');
 const helpers = require('../../utils/helpers');
 
-// ======= Logging helpers =======
-// Ativa logs detalhados quando ANALYSIS_DEBUG ou DEBUG estiverem definidos.
-const ANALYSIS_DEBUG = String(process.env.ANALYSIS_DEBUG || process.env.DEBUG || 'false').toLowerCase() === 'true';
+// ======= Debug / Logging =======
+const ANALYSIS_DEBUG = String(process.env.ANALYSIS_DEBUG || process.env.DEBUG || 'false')
+  .toLowerCase() === 'true';
 
-/**
- * Emite logs padronizados da análise, prefixando com o ID da requisição.
- * @param {string} reqId Identificador de correlação
- * @param  {...any} args Mensagens a serem logadas
- */
-function log(reqId, ...args) {
-  try {
-    console.log(`[ANALYSIS][${reqId}]`, ...args);
-  } catch (e) {
-    // ignora falhas de log
-  }
-}
+function log(reqId, ...args) { try { console.log(`[ANALYSIS][${reqId}]`, ...args); } catch {} }
+function maskToken(tok) { if (!tok || typeof tok !== 'string') return ''; return tok.length <= 8 ? '***' : tok.slice(0,4)+'…'+tok.slice(-4); }
 
-/**
- * Mascara tokens longos para que não vazem em logs.
- * @param {string} tok Token a ser mascarado
- * @returns {string}
- */
-function maskToken(tok) {
-  if (!tok || typeof tok !== 'string') return '';
-  if (tok.length <= 8) return '***';
-  return tok.slice(0, 4) + '…' + tok.slice(-4);
-}
-
-/**
- * Resolve o token da instância desejada consultando a UAZAPI com o
- * token de administrador. Isso substitui o cache global de instâncias
- * presente em server.js e garante que sempre temos o token mais
- * recente. Retorna null caso a instância não seja encontrada.
- *
- * @param {string} instanceId ID da instância a ser resolvida
- * @returns {Promise<string|null>} Token da instância ou null
- */
+// ======= UAZ / DB helpers =======
 async function resolveInstanceToken(instanceId) {
   try {
     const data = await uaz.listInstances(UAZAPI_ADMIN_TOKEN);
-    const list = Array.isArray(data?.content)
-      ? data.content
-      : Array.isArray(data)
-        ? data
-        : [];
-    const it = list.find((x) => {
-      const id = x.id || x._id || x.instanceId || x.token;
-      return String(id) === String(instanceId);
-    });
+    const list = Array.isArray(data?.content) ? data.content : Array.isArray(data) ? data : [];
+    const it = list.find(x => String(x.id || x._id || x.instanceId || x.token) === String(instanceId));
     if (!it) {
-      // Fallback: caso o ID fornecido já seja o próprio token da instância.
-      // Isso é útil quando o front passa o token diretamente em vez do identificador numérico.
-      if (instanceId && typeof instanceId === 'string' && instanceId.length > 4) {
-        // evita retornar strings vazias ou muito curtas; aceita tokens longos
-        return instanceId;
-      }
+      if (instanceId && typeof instanceId === 'string' && instanceId.length > 4) return instanceId; // fallback: ID é o próprio token
       return null;
     }
     return it.token || it.instanceToken || it.key || null;
@@ -99,60 +47,29 @@ async function resolveInstanceToken(instanceId) {
   }
 }
 
-/**
- * Recupera a marca de tempo da última análise registrada para o cliente.
- * Quando `useGate` é falso ou não houver registro, retorna null.
- *
- * @param {string} slug Slug do cliente
- * @param {boolean} useGate Ativa o gate para ignorar mensagens antigas
- * @returns {Promise<Date|null>} Timestamp como objeto Date ou null
- */
 async function getLastAnalysisTs(slug, useGate) {
   if (!useGate) return null;
   try {
-    const r = await pool.query(
-      `SELECT analysis_last_msg_ts FROM client_settings WHERE slug = $1`,
-      [slug]
-    );
+    const r = await pool.query(`SELECT analysis_last_msg_ts FROM client_settings WHERE slug=$1`, [slug]);
     const ts = r.rows?.[0]?.analysis_last_msg_ts;
     return ts ? new Date(ts) : null;
   } catch (err) {
-    console.warn('Falha ao obter analysis_last_msg_ts para', slug, err?.message);
+    console.warn('Falha ao obter analysis_last_msg_ts', slug, err?.message);
     return null;
   }
 }
 
-/**
- * Atualiza a marca de tempo da última análise para o cliente se o gate
- * estiver ativo. Qualquer erro de atualização é logado mas não causa
- * falha no processo de geração de relatório.
- *
- * @param {string} slug Slug do cliente
- * @param {Date|number} ts Novo timestamp (em milissegundos ou objeto Date)
- * @param {boolean} useGate Define se o gate estava ativado para atualizar
- */
 async function updateLastAnalysisTs(slug, ts, useGate) {
   if (!useGate || !ts) return;
   try {
-    const iso = typeof ts === 'number' ? new Date(ts).toISOString() : new Date(ts).toISOString();
-    await pool.query(
-      `UPDATE client_settings SET analysis_last_msg_ts = $2 WHERE slug = $1`,
-      [slug, iso]
-    );
+    const iso = new Date(typeof ts === 'number' ? ts : ts.valueOf()).toISOString();
+    await pool.query(`UPDATE client_settings SET analysis_last_msg_ts=$2 WHERE slug=$1`, [slug, iso]);
   } catch (err) {
     console.error('Erro ao atualizar analysis_last_msg_ts', slug, err?.message);
   }
 }
 
-/**
- * Coleta e ordena os chats de uma instância UAZ. A busca é paginada
- * conforme o tamanho máximo configurado pelo modelo de análise. A lista
- * retornada é ordenada descendentemente pelo último timestamp de
- * atualização e limitada em `ANALYSIS_MAX_CHATS`.
- *
- * @param {string} token Token de acesso da instância
- * @returns {Promise<Array>} Lista de chats selecionados
- */
+// ======= Coleta UAZ =======
 async function collectChats(token) {
   const pageSize = 100;
   let offset = 0;
@@ -164,331 +81,272 @@ async function collectChats(token) {
     chats.push(...page);
     if (page.length < pageSize) break;
     offset += pageSize;
-    if (chats.length >= ANALYSIS_MAX_CHATS * 2) break; // evita loops longos
+    if (chats.length >= ANALYSIS_MAX_CHATS * 2) break; // trava de segurança
   }
-  const chatLastTs = (c) => c?.wa_lastTimestamp || c?.lastMessageTimestamp || c?.updatedAt || c?.createdAt || 0;
-  chats.sort((a, b) => Number(chatLastTs(b)) - Number(chatLastTs(a)));
+  const lastTs = c => c?.wa_lastTimestamp || c?.lastMessageTimestamp || c?.updatedAt || c?.createdAt || 0;
+  chats.sort((a, b) => Number(lastTs(b)) - Number(lastTs(a)));
   return chats.slice(0, ANALYSIS_MAX_CHATS);
 }
 
-/**
- * Coleta mensagens recentes de uma lista de chats. As mensagens são
- * filtradas de acordo com o gate de tempo (última análise) e limitadas
- * a `ANALYSIS_PER_CHAT_LIMIT` por chat. Retorna um array de objetos
- * contendo o timestamp numérico e a mensagem.
- *
- * @param {string} token Token de acesso da instância
- * @param {Array} chats Lista de chats já ordenados
- * @param {Date|null} lastTs Data da última análise ou null
- * @param {boolean} useGate Define se o gate deve ser aplicado
- * @returns {Promise<Array<{timestamp:number,msg:object}>>}
- */
 async function collectMessages(token, chats, lastTs, useGate) {
   const results = [];
   let maxTs = lastTs ? lastTs.getTime() : 0;
+
   for (const chat of chats) {
     const chatId = helpers.extractChatId(chat);
     if (!chatId) continue;
-    const data = await uaz.findMessages(token, {
-      chatid: chatId,
-      limit: ANALYSIS_PER_CHAT_LIMIT,
-      offset: 0,
-    });
+
+    const data = await uaz.findMessages(token, { chatid: chatId, limit: ANALYSIS_PER_CHAT_LIMIT, offset: 0 });
     const msgs = helpers.pickArrayList(data);
-    // Ordena ascendentemente por timestamp
+
     msgs.sort((a, b) => {
       const ta = a?.messageTimestamp || a?.timestamp || a?.wa_timestamp || a?.createdAt || a?.date || 0;
       const tb = b?.messageTimestamp || b?.timestamp || b?.wa_timestamp || b?.createdAt || b?.date || 0;
       return Number(ta) - Number(tb);
     });
+
     for (const msg of msgs) {
       const rawTs = msg?.messageTimestamp || msg?.timestamp || msg?.wa_timestamp || msg?.createdAt || msg?.date || null;
-      let numTs = null;
-      if (rawTs) {
-        if (typeof rawTs === 'string' && /^\d+$/.test(rawTs)) {
-          const n = Number(rawTs);
-          numTs = n < 10 ** 12 ? n * 1000 : n;
-        } else {
-          const n = Number(rawTs);
-          if (Number.isFinite(n)) {
-            numTs = n < 10 ** 12 ? n * 1000 : n;
-          } else {
-            const d = new Date(rawTs);
-            const ms = d.getTime();
-            numTs = Number.isNaN(ms) ? null : ms;
-          }
-        }
-      }
-      if (numTs == null) continue;
-      if (useGate && lastTs && numTs <= lastTs.getTime()) continue;
-      results.push({ timestamp: numTs, msg });
-      if (numTs > maxTs) maxTs = numTs;
+      if (!rawTs) continue;
+      let n = Number(rawTs);
+      if (!Number.isFinite(n)) { const d = new Date(rawTs); n = d.valueOf(); }
+      if (n && n < 10 ** 12) n *= 1000; // segundos -> ms
+
+      if (!n) continue;
+      if (useGate && lastTs && n <= lastTs.getTime()) continue;
+
+      results.push({ timestamp: n, msg });
+      if (n > maxTs) maxTs = n;
     }
   }
+
   return { messages: results, maxTs };
 }
 
-/**
- * Constrói a transcrição compacta das mensagens coletadas. As mensagens
- * precisam estar ordenadas. A transcrição consiste em linhas no formato
- * definido por `toTranscriptLine`, removendo itens vazios.
- *
- * @param {Array<{timestamp:number,msg:object}>} items Mensagens ordenadas
- * @returns {Array<string>} Lista de linhas de transcrição
- */
 function buildTranscript(items) {
   return items.map(({ msg }) => toTranscriptLine(msg)).filter(Boolean);
 }
 
-/**
- * Agrupa linhas de transcrição em blocos respeitando o orçamento de
- * tokens configurado. Cada bloco inclui o texto introdutório e o
- * prompt do sistema. Retorna uma lista de strings, uma por bloco.
- *
- * @param {Array<string>} lines Linhas da transcrição
- * @param {string} systemPrompt Prompt de sistema
- * @param {string} userIntro Texto de introdução do usuário
- * @returns {Array<string>}
- */
 function chunkTranscript(lines, systemPrompt, userIntro) {
   const chunks = [];
   const baseTokens = approxTokens(systemPrompt) + approxTokens(userIntro) + 50;
-  let current = [];
-  let currentTokens = baseTokens;
+  let cur = [];
+  let curTok = baseTokens;
+
   for (const line of lines) {
     const t = approxTokens(line) + 1;
-    if (current.length && currentTokens + t > ANALYSIS_INPUT_BUDGET) {
-      chunks.push(current.join('\n'));
-      current = [line];
-      currentTokens = baseTokens + approxTokens(line);
+    if (cur.length && curTok + t > ANALYSIS_INPUT_BUDGET) {
+      chunks.push(cur.join('\n'));
+      cur = [line];
+      curTok = baseTokens + approxTokens(line);
     } else {
-      current.push(line);
-      currentTokens += t;
+      cur.push(line);
+      curTok += t;
     }
   }
-  if (current.length) chunks.push(current.join('\n'));
+  if (cur.length) chunks.push(cur.join('\n'));
   return chunks;
 }
 
-/**
- * Invoca a API de chat da OpenAI para cada bloco de transcrição. Ajusta
- * automaticamente os parâmetros de requisição de acordo com o modelo em
- * uso (modelos de raciocínio versus modelos clássicos). Se ocorrer um
- * erro em algum bloco, apenas loga e continua com os demais. Retorna
- * uma lista de respostas (strings) já aparadas.
- *
- * @param {Array<string>} chunks Blocos de transcrição
- * @param {string} systemPrompt Prompt de sistema
- * @param {string} userIntro Introdução do usuário
- * @param {string} openaiKey Chave da API da OpenAI
- * @returns {Promise<Array<string>>}
- */
-/**
- * Helper para detectar se um nome de modelo pertence à família de
- * raciocínio da OpenAI (ex.: gpt-5*, gpt-4o*, omni*). Esses modelos
- * utilizam a API de "responses" em vez da API de chat.
- *
- * @param {string} name Nome do modelo
- * @returns {boolean}
- */
 function isReasoningModelName(name) {
   const n = String(name || '').toLowerCase();
   return /(gpt-5|gpt-4o|omni)/i.test(n);
 }
 
 /**
- * Invoca a API da OpenAI para cada bloco de transcrição. Para modelos
- * clássicos, usa o endpoint chat/completions; para modelos de
- * raciocínio (gpt-5*, gpt-4o*, omni*), usa o endpoint responses. Em
- * caso de erro registra a mensagem e continua. Retorna um objeto
- * contendo as respostas obtidas e a lista de erros coletados.
- *
- * @param {Array<string>} chunks Blocos de transcrição
- * @param {string} systemPrompt Prompt de sistema
- * @param {string} userIntro Introdução do usuário
- * @param {string} openaiKey Chave da API da OpenAI
- * @returns {Promise<{responses:string[],errors:string[]}>}
+ * Chama OpenAI (Responses API / Chat) e SEMPRE retorna { responses, errors }.
+ * Mais resiliente na extração de texto.
  */
-async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId = undefined) {
+async function callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId) {
   const responses = [];
   const errors = [];
   const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
   const reasoning = isReasoningModelName(model);
+
   for (const contentBody of chunks) {
     const content = `${userIntro}\n\n${contentBody}`;
+
     try {
       let text = '';
+
       if (reasoning) {
+        // Responses API — força texto e trata vários formatos de retorno
         const payload = {
           model,
           input: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
           ],
+          response_format: { type: 'text' }, // garante data.output_text
           max_output_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
           reasoning: { effort: process.env.OPENAI_REASONING_EFFORT || 'low' },
         };
-        const tEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tEnv !== undefined ? Number(tEnv) : undefined;
-        if (parsedTemp !== undefined && !Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-        const startTs = Date.now();
+        const temp = process.env.OPENAI_TEMPERATURE;
+        if (temp !== undefined && !Number.isNaN(Number(temp))) payload.temperature = Number(temp);
+
+        const t0 = Date.now();
         const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
           headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
           timeout: 60000,
           validateStatus: () => true,
         });
         if (ANALYSIS_DEBUG && reqId) {
-          const usage = resp?.data?.usage || {};
-          log(reqId, `openai responses status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
+          log(reqId, `responses status=${resp.status} dt=${Date.now()-t0}ms usage=${JSON.stringify(resp?.data?.usage || {})}`);
         }
+
         if (resp.status >= 400) {
-          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
-          errors.push(errMsg);
+          errors.push(resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`);
         } else {
-          text = resp?.data?.output_text || resp?.data?.choices?.[0]?.message?.content || '';
+          // 1) caminho preferido
+          if (typeof resp?.data?.output_text === 'string' && resp.data.output_text.trim()) {
+            text = resp.data.output_text.trim();
+          }
+
+          // 2) mensagem estruturada em data.output[].content[].text
+          if (!text && Array.isArray(resp?.data?.output)) {
+            const parts = [];
+            for (const out of resp.data.output) {
+              const contentArr = Array.isArray(out?.content) ? out.content : [];
+              for (const c of contentArr) {
+                if (typeof c?.text === 'string') parts.push(c.text);
+                else if (typeof c === 'string')   parts.push(c);
+              }
+            }
+            text = parts.join('\n').trim();
+          }
+
+          // 3) alguns backends ainda retornam choices
+          if (!text && Array.isArray(resp?.data?.choices)) {
+            text = resp.data.choices
+              .map(c => c?.message?.content || c?.text || '')
+              .filter(Boolean)
+              .join('\n')
+              .trim();
+          }
+
+          // 4) fallback final: chat/completions
+          if (!text) {
+            const chatPayload = {
+              model,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content },
+              ],
+              max_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
+              n: 1,
+            };
+            const chat = await axios.post('https://api.openai.com/v1/chat/completions', chatPayload, {
+              headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+              timeout: 60000,
+            });
+            text = chat?.data?.choices?.[0]?.message?.content || '';
+          }
         }
       } else {
+        // Modelos clássicos: chat/completions
         const payload = {
           model,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content },
           ],
-          n: 1,
           max_tokens: Number(process.env.OPENAI_OUTPUT_BUDGET || ANALYSIS_OUTPUT_BUDGET) || 1024,
+          n: 1,
         };
-        const tEnv = process.env.OPENAI_TEMPERATURE;
-        const parsedTemp = tEnv !== undefined ? Number(tEnv) : 0.5;
-        if (!Number.isNaN(parsedTemp)) payload.temperature = parsedTemp;
-        const startTs = Date.now();
+        const temp = process.env.OPENAI_TEMPERATURE;
+        if (temp !== undefined && !Number.isNaN(Number(temp))) payload.temperature = Number(temp);
+
+        const t0 = Date.now();
         const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
           headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
           timeout: 60000,
           validateStatus: () => true,
         });
         if (ANALYSIS_DEBUG && reqId) {
-          const usage = resp?.data?.usage || {};
-          log(reqId, `openai chat status=${resp.status} dt=${Date.now() - startTs}ms usage=${JSON.stringify(usage)}`);
+          log(reqId, `chat status=${resp.status} dt=${Date.now()-t0}ms usage=${JSON.stringify(resp?.data?.usage || {})}`);
         }
+
         if (resp.status >= 400) {
-          const errMsg = resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`;
-          errors.push(errMsg);
+          errors.push(resp?.data?.error?.message || `OpenAI HTTP ${resp.status}`);
         } else {
           text = resp?.data?.choices?.[0]?.message?.content || '';
         }
       }
-      if (text && text.trim()) {
-        const trimmed = text.trim();
-        if (ANALYSIS_DEBUG && reqId) {
-          log(reqId, `chunk ok text[0..120]=${JSON.stringify(trimmed.slice(0, 120))}`);
-        }
-        responses.push(trimmed);
+
+      if (typeof text === 'string' && text.trim()) {
+        const clean = text.trim();
+        if (ANALYSIS_DEBUG && reqId) log(reqId, `chunk -> ${clean.length} chars`);
+        responses.push(clean);
+      } else {
+        errors.push('Resposta vazia do modelo');
       }
     } catch (err) {
-      const msgErr = err.response?.data?.error?.message || err.message || err.toString();
-      errors.push(msgErr);
-      console.error('[ANALYSIS] Erro ao chamar OpenAI', msgErr);
+      const msg = err?.response?.data?.error?.message || err?.message || String(err);
+      console.error('[ANALYSIS] OpenAI error:', msg);
+      errors.push(msg);
     }
   }
+
   return { responses, errors };
 }
 
-/**
- * Gera um relatório em PDF a partir das conversas recentes de uma
- * instância UAZ. Retorna um Buffer com o conteúdo do PDF. Em caso de
- * erro ou ausência de mensagens novas, gera um PDF contendo uma
- * mensagem apropriada. A lógica de fallback (por exemplo, falta de
- * chave OpenAI) também está tratada aqui.
- *
- * @param {string} instanceId ID da instância UAZ
- * @param {string} slug Slug do cliente (prefixo da tabela)
- * @param {boolean} force Ignora o gate de última análise se true
- * @returns {Promise<Buffer>} PDF pronto para ser enviado ao cliente
- */
+// ======= Orquestração / PDF =======
 async function generateAnalysisPdf(instanceId, slug, force = true, opts = {}) {
-  // Valida o slug (formato cliente_nome)
-  if (!slug || !/^([a-z0-9_]+)$/.test(slug)) {
-    return generatePdfBuffer('Cliente inválido.');
-  }
+  if (!slug || !/^([a-z0-9_]+)$/.test(slug)) return generatePdfBuffer('Cliente inválido.');
 
-  // Gera identificador de requisição (reqId) para logs; usa opts.reqId se fornecido
-  const reqId = opts && opts.reqId ? opts.reqId : ('local-' + Date.now().toString(36));
-  // Determina se o gate está habilitado
+  const reqId = opts?.reqId || ('local-' + Date.now().toString(36));
   const useGate = !force && (process.env.ANALYSIS_USE_LAST_GATE === 'true');
 
-  // Checa a chave e o modelo da OpenAI
   const openaiKey = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
   if (!openaiKey || !model) {
     return generatePdfBuffer('Análise indisponível: OPENAI_API_KEY/OPENAI_MODEL não configurado.');
   }
 
-  // Resolve token da instância
   const token = await resolveInstanceToken(instanceId);
   if (ANALYSIS_DEBUG) log(reqId, `instance ${instanceId} -> token=${maskToken(token)}`);
-  if (!token) {
-    return generatePdfBuffer('Instância não encontrada ou sem token.');
-  }
+  if (!token) return generatePdfBuffer('Instância não encontrada ou sem token.');
 
   appendLog(`🟢 Início da análise - Cliente: ${slug}`);
-  const startTime = Date.now();
+  const t0 = Date.now();
 
-  // Obtém última análise
   const lastTs = await getLastAnalysisTs(slug, useGate);
 
-  // 1) Coleta e ordena chats
   const chats = await collectChats(token);
-
-  // 2) Coleta mensagens
   const { messages: allMessages, maxTs } = await collectMessages(token, chats, lastTs, useGate);
+  if (ANALYSIS_DEBUG) log(reqId, `chats=${chats.length} totalMsgs=${allMessages.length}`);
+  if (!allMessages.length) return generatePdfBuffer('Nenhuma mensagem nova para analisar.');
 
-  // Registra número total de chats e mensagens para fins de depuração
-  const totalMsgs = allMessages.length;
-  if (ANALYSIS_DEBUG) log(reqId, `chats=${chats.length} totalMsgs=${totalMsgs}`);
-
-  if (!allMessages.length) {
-    return generatePdfBuffer('Nenhuma mensagem nova para analisar.');
-  }
-
-  // Ordena em ordem crescente
   allMessages.sort((a, b) => a.timestamp - b.timestamp);
   const lines = buildTranscript(allMessages);
-  // Prompt de sistema: permite override via variável de ambiente e prompt de override
-  const systemPrompt = (process.env.OPENAI_SYSTEM_PROMPT || SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT || '').toString().trim() ||
+
+  const systemPrompt =
+    (process.env.OPENAI_SYSTEM_PROMPT || SYSTEM_PROMPT_OVERRIDE || DEFAULT_SYSTEM_PROMPT || '')
+      .toString()
+      .trim() ||
     'Você é um analista de desempenho conversacional. Gere sugestões práticas e diretas.';
-  // Texto de introdução para o usuário
+
   const userIntro =
     `Contexto: A seguir estão amostras de conversas entre a assistente Luna e leads B2B do cliente "${slug}".` +
     `\nGere um relatório curto em português com tópicos práticos de melhoria, exemplos reescritos e um resumo executivo em até 3 linhas.`;
+
   const chunks = chunkTranscript(lines, systemPrompt, userIntro);
   appendLog(`→ Coletados ${chats.length} chats e ${lines.length} mensagens. Lotes: ${chunks.length}.`);
 
-  let suggestions = '';
-  let errors = [];
-  {
-    const { responses, errors: callErrors } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId);
-    // "responses" is an array of suggestion strings from OpenAI. Use join to combine them.
-    suggestions = Array.isArray(responses) ? responses.join('\n\n---\n\n') : '';
-    errors = callErrors;
-  }
+  const { responses, errors: callErrors } = await callOpenAI(chunks, systemPrompt, userIntro, openaiKey, reqId);
+  const suggestions = Array.isArray(responses) ? responses.join('\n\n---\n\n') : '';
 
-  // Atualiza lastTs somente se gate ativo
-  if (useGate && maxTs) {
-    await updateLastAnalysisTs(slug, maxTs, useGate);
-  }
+  if (useGate && maxTs) await updateLastAnalysisTs(slug, maxTs, useGate);
 
-  const elapsed = Date.now() - startTime;
-  appendLog(`🏁 Fim da análise — ${chunks.length} lotes, tempo total ${elapsed}ms`);
+  appendLog(`🏁 Fim da análise — ${chunks.length} lotes, tempo total ${Date.now()-t0}ms`);
+
   let finalText = suggestions || 'Nenhuma sugestão gerada.';
-  if (!suggestions && errors && errors.length) {
-    finalText = `Falha ao gerar sugestões.\nPrimeiro erro: ${errors[0]}`;
-    if (ANALYSIS_DEBUG) log(reqId, `no suggestions. errors=${errors[0]}`);
-  } else if (suggestions && ANALYSIS_DEBUG) {
-    log(reqId, `final length=${suggestions.length}`);
+  if (!suggestions && callErrors && callErrors.length) {
+    finalText = `Falha ao gerar sugestões.\nPrimeiro erro: ${callErrors[0]}`;
+    if (ANALYSIS_DEBUG) log(reqId, `no suggestions: ${callErrors[0]}`);
   }
+
   return generatePdfBuffer(finalText);
 }
 
-module.exports = {
-  generateAnalysisPdf,
-};
+module.exports = { generateAnalysisPdf };
