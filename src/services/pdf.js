@@ -31,13 +31,6 @@ function escapePdfString(str) {
  * e descendo 14 pontos por linha. Caso as linhas excedam o espaço
  * vertical, as linhas restantes são descartadas (não há novas páginas).
  *
- * Esta versão especifica explicitamente a codificação WinAnsiEncoding
- * para a fonte embutida. Isso garante que caracteres acentuados
- * (como ç, ã, õ, á, é etc.) sejam mapeados corretamente para os
- * glifos disponíveis na fonte Helvetica padrão. Sem essa especificação,
- * o PDF viewer usaria StandardEncoding, que não contempla boa parte
- * dos caracteres de línguas latinas.
- *
  * @param {string} text
  * @returns {Buffer}
  */
@@ -58,9 +51,12 @@ function generatePdfBuffer(text) {
   const obj1 = '1 0 obj<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
   const obj2 = '2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n';
   const obj3 = '3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n';
-  // Utilize WinAnsiEncoding para mapear caracteres estendidos corretamente.  Sem especificar
-  // essa codificação, a fonte padrão usa StandardEncoding, que tem suporte
-  // limitado a caracteres acentuados.
+  // Especifica explicitamente a codificação WinAnsiEncoding para a fonte Helvetica.  Sem
+  // informar uma codificação, o PDF usa StandardEncoding, que não contém muitos
+  // caracteres acentuados, resultando em erros como “Observaçæes” no PDF.  O
+  // WinAnsiEncoding (equivalente ao Windows‑1252) mapeia códigos 0x80‑0xFF
+  // para os glifos corretos na fonte Helvetica. Isso permite exibir letras
+  // como ç, ã, õ, Á etc. de forma correta.
   const obj4 = '4 0 obj<< /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n';
   const obj5 = `5 0 obj<< /Length ${streamLength} >>\nstream\n${contentStream}\nendstream\nendobj\n`;
   const header = '%PDF-1.4\n';
