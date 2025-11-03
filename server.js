@@ -1586,6 +1586,69 @@ app.post('/api/instances/:id/interactive/reply', async (req, res) => {
 });
 
 /**
+ * GET /api/debug/ping-openai
+ *
+ * Endpoint para testar a comunicação com a OpenAI sem passar pela UAZAPI. Útil
+ * para validar se a chave OPENAI_API_KEY está correta e se o modelo definido
+ * em OPENAI_MODEL (ou ANALYSIS_MODEL) é compatível. Retorna um pequeno
+ * trecho de texto gerado pela IA ou uma mensagem de erro.
+ *
+ * Exemplo de uso: GET /api/debug/ping-openai
+ */
+app.get('/api/debug/ping-openai', async (req, res) => {
+  try {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const model = process.env.OPENAI_MODEL || ANALYSIS_MODEL;
+    if (!openaiKey || !model) {
+      return res.status(500).json({ ok: false, error: 'OPENAI_API_KEY ou OPENAI_MODEL/ANALYSIS_MODEL não configurado' });
+    }
+    const lower = String(model || '').toLowerCase();
+    const isReasoning = /(gpt-5|gpt-4o|omni)/i.test(lower);
+    let url;
+    let payload;
+    if (isReasoning) {
+      // Usa o endpoint responses para modelos de raciocínio
+      url = 'https://api.openai.com/v1/responses';
+      payload = {
+        model,
+        input: [
+          { role: 'system', content: 'Você é um respondedor de ping.' },
+          { role: 'user', content: 'Diga "OK" se estiver funcionando.' },
+        ],
+        max_output_tokens: 10,
+        reasoning: { effort: 'low' },
+      };
+    } else {
+      // Usa o endpoint chat/completions para modelos clássicos
+      url = 'https://api.openai.com/v1/chat/completions';
+      payload = {
+        model,
+        messages: [
+          { role: 'system', content: 'Você é um respondedor de ping.' },
+          { role: 'user', content: 'Diga "OK" se estiver funcionando.' },
+        ],
+        max_tokens: 10,
+        n: 1,
+      };
+    }
+    const response = await axios.post(url, payload, {
+      headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    let reply;
+    if (isReasoning) {
+      reply = response?.data?.output_text || response?.data?.choices?.[0]?.message?.content || '';
+    } else {
+      reply = response?.data?.choices?.[0]?.message?.content || '';
+    }
+    return res.json({ ok: true, reply: String(reply).trim() });
+  } catch (err) {
+    const msgErr = err.response?.data?.error?.message || err.message || err.toString();
+    return res.status(500).json({ ok: false, error: msgErr });
+  }
+});
+
+/**
  * GET /api/instances/:id/export-analysis.pdf
  *
  * Gera um relatório em PDF contendo apenas as sugestões da IA para as conversas recentes.
