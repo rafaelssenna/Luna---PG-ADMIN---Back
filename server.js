@@ -1232,22 +1232,35 @@ async function runLoopForClient(clientSlug, opts = {}) {
       if (stopRequests.has(clientSlug)) { manualStop = true; }
 
       // SEMPRE remove da fila após processar (sucesso ou erro), para evitar loops infinitos
+      // Usa transação para garantir consistência entre DELETE e UPDATE
       if (!manualStop) {
-        try { 
-          await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]); 
-        } catch (err) { 
-          console.error('Erro ao deletar da fila', clientSlug, phone, err); 
-        }
-        
-        if (shouldMark) {
-          try { 
-            await pool.query(`UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`, [phone]); 
-          } catch (err) { 
-            console.error('Erro ao atualizar histórico', clientSlug, phone, err); 
+        try {
+          await pool.query('BEGIN');
+          
+          // Remove da fila
+          await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]);
+          
+          // Atualiza totais se envio foi bem-sucedido
+          if (shouldMark) {
+            await pool.query(
+              `INSERT INTO "${clientSlug}_totais" (name, phone, niche, mensagem_enviada, updated_at)
+               VALUES ($1, $2, $3, true, NOW())
+               ON CONFLICT (phone) 
+               DO UPDATE SET mensagem_enviada = true, updated_at = NOW();`,
+              [name, phone, niche]
+            );
+            processed++;
           }
-          processed++;
-        } else {
-          console.warn(`[${clientSlug}] Envio falhou ou foi pulado (${status}). Removido da fila: ${phone}`);
+          
+          await pool.query('COMMIT');
+          
+          if (!shouldMark) {
+            console.warn(`[${clientSlug}] Envio falhou ou foi pulado (${status}). Removido da fila: ${phone}`);
+          }
+        } catch (err) {
+          await pool.query('ROLLBACK');
+          console.error(`[${clientSlug}] Erro ao processar ${phone}:`, err.message);
+          // Mesmo com erro, adiciona ao attemptedPhones para não tentar novamente neste loop
         }
       }
 
