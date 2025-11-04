@@ -1163,18 +1163,36 @@ async function runLoopForClient(clientSlug, opts = {}) {
       if (attemptedPhones.size) {
         const arr = Array.from(attemptedPhones);
         const ph  = arr.map((_, idx) => `$${idx + 1}`).join(',');
-        whereNotIn = `WHERE phone NOT IN (${ph})`;
+        whereNotIn = `AND f.phone NOT IN (${ph})`;
         params = arr;
       }
 
-      // Tenta buscar name, phone, niche da fila; se a coluna 'niche' não existir, cai no fallback.
+      // Busca da fila APENAS registros que NÃO foram marcados como enviados na tabela totais
+      // Isso evita processar o mesmo número múltiplas vezes
       let name, phone, niche;
       try {
-        const next = await pool.query(`SELECT name, phone, niche FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
+        const next = await pool.query(`
+          SELECT f.name, f.phone, f.niche 
+          FROM "${clientSlug}" f
+          LEFT JOIN "${clientSlug}_totais" t ON f.phone = t.phone
+          WHERE (t.mensagem_enviada IS NOT TRUE OR t.phone IS NULL)
+            ${whereNotIn}
+          ORDER BY f.name 
+          LIMIT 1;
+        `, params);
         if (!next.rows.length) break;
         ({ name, phone, niche } = next.rows[0]);
       } catch {
-        const next = await pool.query(`SELECT name, phone FROM "${clientSlug}" ${whereNotIn} ORDER BY name LIMIT 1;`, params);
+        // Fallback caso a coluna niche não exista
+        const next = await pool.query(`
+          SELECT f.name, f.phone 
+          FROM "${clientSlug}" f
+          LEFT JOIN "${clientSlug}_totais" t ON f.phone = t.phone
+          WHERE (t.mensagem_enviada IS NOT TRUE OR t.phone IS NULL)
+            ${whereNotIn}
+          ORDER BY f.name 
+          LIMIT 1;
+        `, params);
         if (!next.rows.length) break;
         ({ name, phone } = next.rows[0]);
         try {
@@ -1213,12 +1231,24 @@ async function runLoopForClient(clientSlug, opts = {}) {
 
       if (stopRequests.has(clientSlug)) { manualStop = true; }
 
-      if (shouldMark && !manualStop) {
-        try { await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]); } catch (err) { console.error('Erro ao deletar da fila', clientSlug, phone, err); }
-        try { await pool.query(`UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`, [phone]); } catch (err) { console.error('Erro ao atualizar histórico', clientSlug, phone, err); }
-        processed++;
-      } else if (!manualStop) {
-        console.warn(`[${clientSlug}] NÃO marcou como enviada (${status}). Mantendo na fila: ${phone}`);
+      // SEMPRE remove da fila após processar (sucesso ou erro), para evitar loops infinitos
+      if (!manualStop) {
+        try { 
+          await pool.query(`DELETE FROM "${clientSlug}" WHERE phone = $1;`, [phone]); 
+        } catch (err) { 
+          console.error('Erro ao deletar da fila', clientSlug, phone, err); 
+        }
+        
+        if (shouldMark) {
+          try { 
+            await pool.query(`UPDATE "${clientSlug}_totais" SET mensagem_enviada = true, updated_at = NOW() WHERE phone = $1;`, [phone]); 
+          } catch (err) { 
+            console.error('Erro ao atualizar histórico', clientSlug, phone, err); 
+          }
+          processed++;
+        } else {
+          console.warn(`[${clientSlug}] Envio falhou ou foi pulado (${status}). Removido da fila: ${phone}`);
+        }
       }
 
       try {
