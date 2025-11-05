@@ -743,12 +743,15 @@ app.get('/api/totals', async (req, res) => {
 app.post('/api/contacts', async (req, res) => {
   const { client, name, phone, niche } = req.body;
   if (!client || !validateSlug(client)) return res.status(400).json({ error: 'Cliente inválido' });
-  if (!name || !phone) return res.status(400).json({ error: 'Nome e telefone são obrigatórios' });
+  if (!phone) return res.status(400).json({ error: 'Telefone é obrigatório' });
+
+  // Se não tiver nome, usa o telefone como nome
+  const finalName = name || phone;
 
   try {
     const result = await pool.query(
       'SELECT client_add_contact($1, $2, $3, $4) AS status;',
-      [client, name, phone, niche || null]
+      [client, finalName, phone, niche || null]
     );
     const status = result.rows[0]?.status || 'inserted';
     res.json({ status });
@@ -775,8 +778,8 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
 
     const header = rows[0] || [];
     const idx    = mapHeader(header);
-    if (idx.name === -1 || idx.phone === -1) {
-      return res.status(400).json({ error: 'Cabeçalho inválido. Precisa conter colunas de nome e telefone.' });
+    if (idx.phone === -1) {
+      return res.status(400).json({ error: 'Cabeçalho inválido. Precisa conter coluna de telefone.' });
     }
 
     let inserted = 0, skipped = 0, errors = 0;
@@ -792,15 +795,18 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       const phone = (r[idx.phone] || '').toString().trim();
       const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
 
-      if (!name || !phone) { 
-        console.log(`[IMPORT] Linha ${i}: Pulada (nome ou telefone vazio)`);
+      if (!phone) { 
+        console.log(`[IMPORT] Linha ${i}: Pulada (telefone vazio)`);
         skipped++; 
         continue; 
       }
 
+      // Se não tiver nome, usa o telefone como nome
+      const finalName = name || phone;
+
       try {
-        console.log(`[IMPORT] Linha ${i}: Processando ${name} - ${phone}`);
-        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, name, phone, niche]);
+        console.log(`[IMPORT] Linha ${i}: Processando ${finalName} - ${phone}`);
+        const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, finalName, phone, niche]);
         const status = q.rows[0]?.status || 'inserted';
         console.log(`[IMPORT] Linha ${i}: Status retornado = ${status}`);
         
