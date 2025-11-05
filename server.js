@@ -781,6 +781,9 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
 
     let inserted = 0, skipped = 0, errors = 0;
 
+    console.log(`[IMPORT] Iniciando importação para cliente: ${slug}`);
+    console.log(`[IMPORT] Total de linhas no CSV: ${rows.length - 1}`);
+
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
       if (!r || !r.length) continue;
@@ -789,17 +792,33 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
       const phone = (r[idx.phone] || '').toString().trim();
       const niche = idx.niche !== -1 ? (r[idx.niche] || '').toString().trim() : null;
 
-      if (!name || !phone) { skipped++; continue; }
+      if (!name || !phone) { 
+        console.log(`[IMPORT] Linha ${i}: Pulada (nome ou telefone vazio)`);
+        skipped++; 
+        continue; 
+      }
 
       try {
+        console.log(`[IMPORT] Linha ${i}: Processando ${name} - ${phone}`);
         const q = await pool.query('SELECT client_add_contact($1, $2, $3, $4) AS status;', [slug, name, phone, niche]);
         const status = q.rows[0]?.status || 'inserted';
-        if (status === 'inserted') inserted++; else skipped++;
+        console.log(`[IMPORT] Linha ${i}: Status retornado = ${status}`);
+        
+        if (status === 'inserted') {
+          inserted++;
+          console.log(`[IMPORT] Linha ${i}: ✓ Inserido com sucesso`);
+        } else {
+          skipped++;
+          console.log(`[IMPORT] Linha ${i}: ⊘ Ignorado (motivo: ${status})`);
+        }
       } catch (e) {
-        console.error('Erro linha CSV', i, e);
+        console.error(`[IMPORT] Linha ${i}: ✗ ERRO:`, e.message);
+        console.error(`[IMPORT] Linha ${i}: Stack:`, e.stack);
         errors++;
       }
     }
+
+    console.log(`[IMPORT] Resultado final: ${inserted} inseridos, ${skipped} ignorados, ${errors} erros`);
 
     res.json({ inserted, skipped, errors });
   } catch (err) {
@@ -925,8 +944,10 @@ app.post('/api/leads', async (req, res) => {
 
     await ensureRegionColumns(client);
 
+    console.log(`[LEADS] Buscando leads: region=${region}, niche=${niche}, limit=${limit}`);
     const raw = await searchLeads({ region, niche, limit });
     const results = Array.isArray(raw) ? raw : [];
+    console.log(`[LEADS] Encontrados ${results.length} leads`);
 
     let inserted = 0, skipped = 0, errors = 0;
 
@@ -936,19 +957,34 @@ app.post('/api/leads', async (req, res) => {
       const reg   = (item.region ?? region) || null;
       const nich  = (item.niche  ?? niche ) || null;
 
-      if (!phone) { skipped++; continue; }
+      if (!phone) { 
+        console.log(`[LEADS] Lead sem telefone, pulando`);
+        skipped++; 
+        continue; 
+      }
 
       try {
+        console.log(`[LEADS] Processando: ${name} - ${phone} (region: ${reg}, niche: ${nich})`);
         const r = await pool.query(`SELECT client_add_lead($1,$2,$3,$4,$5) AS status;`,
           [client, name, phone, reg, nich]);
         const status = r.rows?.[0]?.status || 'inserted';
-        if (status === 'inserted' || status === 'queued_existing') inserted++;
-        else skipped++;
+        console.log(`[LEADS] Status retornado: ${status}`);
+        
+        if (status === 'inserted' || status === 'queued_existing') {
+          inserted++;
+          console.log(`[LEADS] ✓ Lead adicionado: ${phone}`);
+        } else {
+          skipped++;
+          console.log(`[LEADS] ⊘ Lead ignorado: ${phone} (motivo: ${status})`);
+        }
       } catch (e) {
-        console.error('Erro ao inserir lead', client, phone, e);
+        console.error(`[LEADS] ✗ ERRO ao inserir lead ${phone}:`, e.message);
+        console.error(`[LEADS] Stack:`, e.stack);
         errors++;
       }
     }
+
+    console.log(`[LEADS] Resultado final: ${inserted} inseridos, ${skipped} ignorados, ${errors} erros`);
 
     res.json({ found: results.length, inserted, skipped, errors });
   } catch (err) {
