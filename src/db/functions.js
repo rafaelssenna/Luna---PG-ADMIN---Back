@@ -71,14 +71,9 @@ async function ensureSQLFunctions() {
     // Primeiro garante que todas as tabelas existentes tenham as colunas necessárias
     await ensureClientColumns();
 
-    // Remove funções antigas se existirem (para evitar conflito de parâmetros)
-    await pool.query(`DROP FUNCTION IF EXISTS create_full_client_structure(TEXT);`);
-    await pool.query(`DROP FUNCTION IF EXISTS client_add_contact(TEXT, TEXT, TEXT, TEXT);`);
-    await pool.query(`DROP FUNCTION IF EXISTS client_add_lead(TEXT, TEXT, TEXT, TEXT, TEXT);`);
-
     // Função para criar estrutura completa de um cliente
     await pool.query(`
-      CREATE FUNCTION create_full_client_structure(client_slug TEXT)
+      CREATE OR REPLACE FUNCTION create_full_client_structure(client_slug TEXT)
       RETURNS void AS $$
       BEGIN
         -- Cria tabela de fila
@@ -117,7 +112,7 @@ async function ensureSQLFunctions() {
 
     // Função para adicionar contato
     await pool.query(`
-      CREATE FUNCTION client_add_contact(
+      CREATE OR REPLACE FUNCTION client_add_contact(
         client_slug TEXT,
         contact_name TEXT,
         contact_phone TEXT,
@@ -163,7 +158,7 @@ async function ensureSQLFunctions() {
 
     // Função para adicionar lead (com região)
     await pool.query(`
-      CREATE FUNCTION client_add_lead(
+      CREATE OR REPLACE FUNCTION client_add_lead(
         client_slug TEXT,
         lead_name TEXT,
         lead_phone TEXT,
