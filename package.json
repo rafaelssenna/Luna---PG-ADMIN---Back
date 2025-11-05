@@ -26,6 +26,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test:db": "node test-db.js"
   }
 }
