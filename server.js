@@ -43,6 +43,8 @@ const {
   snapshotPush,
   snapshotEnd,
 } = require('./src/utils/progress');
+// Funções SQL do banco de dados
+const { ensureSQLFunctions } = require('./src/db/functions');
 // Estado global e parâmetros padrão
 const {
   runningClients,
@@ -65,6 +67,8 @@ const {
 
 // Garante que a tabela client_settings exista (importado de src/db/settings.js)
 ensureSettingsTable().catch((e) => console.error('ensureSettingsTable', e));
+// Garante que as funções SQL necessárias existam (importado de src/db/functions.js)
+ensureSQLFunctions().catch((e) => console.error('ensureSQLFunctions', e));
 
 // ==== Helpers reutilizáveis ====
 // Importa funções utilitárias (extractChatId, pickArrayList, etc.) do novo módulo utils/helpers.
