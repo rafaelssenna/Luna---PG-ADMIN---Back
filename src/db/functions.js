@@ -8,11 +8,69 @@
 const { pool } = require('../config');
 
 /**
+ * Garante que todas as tabelas de clientes existentes tenham as colunas necessárias
+ */
+async function ensureClientColumns() {
+  try {
+    // Busca todas as tabelas de clientes (exceto _totais)
+    const { rows } = await pool.query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT LIKE '%\\_totais'
+        AND table_name != 'client_settings'
+      ORDER BY table_name;
+    `);
+
+    for (const { table_name } of rows) {
+      try {
+        // Adiciona coluna niche se não existir
+        await pool.query(`ALTER TABLE "${table_name}" ADD COLUMN IF NOT EXISTS niche TEXT;`);
+        
+        // Adiciona coluna region se não existir  
+        await pool.query(`ALTER TABLE "${table_name}" ADD COLUMN IF NOT EXISTS region TEXT;`);
+        
+        // Adiciona coluna created_at se não existir
+        await pool.query(`ALTER TABLE "${table_name}" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
+
+        // Faz o mesmo para tabela _totais se existir
+        const totaisTable = `${table_name}_totais`;
+        const { rows: totaisExists } = await pool.query(
+          `SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+          );`,
+          [totaisTable]
+        );
+
+        if (totaisExists[0]?.exists) {
+          await pool.query(`ALTER TABLE "${totaisTable}" ADD COLUMN IF NOT EXISTS niche TEXT;`);
+          await pool.query(`ALTER TABLE "${totaisTable}" ADD COLUMN IF NOT EXISTS region TEXT;`);
+          await pool.query(`ALTER TABLE "${totaisTable}" ADD COLUMN IF NOT EXISTS mensagem_enviada BOOLEAN DEFAULT false;`);
+          await pool.query(`ALTER TABLE "${totaisTable}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`);
+        }
+
+        console.log(`[DB] Colunas verificadas/criadas para: ${table_name}`);
+      } catch (e) {
+        console.warn(`[DB] Aviso ao verificar colunas de ${table_name}:`, e.message);
+      }
+    }
+  } catch (error) {
+    console.error('[DB] Erro ao garantir colunas:', error.message);
+  }
+}
+
+/**
  * Cria ou atualiza as funções SQL necessárias no banco de dados.
  * Esta função é idempotente e pode ser executada múltiplas vezes sem problemas.
  */
 async function ensureSQLFunctions() {
   try {
+    // Primeiro garante que todas as tabelas existentes tenham as colunas necessárias
+    await ensureClientColumns();
+
     // Função para criar estrutura completa de um cliente
     await pool.query(`
       CREATE OR REPLACE FUNCTION create_full_client_structure(client_slug TEXT)
